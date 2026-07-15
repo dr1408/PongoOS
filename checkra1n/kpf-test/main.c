@@ -105,6 +105,9 @@ extern kern_return_t mach_vm_protect(vm_map_t task, mach_vm_address_t addr, mach
 
 extern void module_entry(void);
 extern void (*preboot_hook)(void);
+extern void kpf_overlay_cmd(const char *cmd, char *args);
+extern void* xnu_va_to_ptr(uint64_t va);
+extern uint64_t xnu_ptr_to_va(void* ptr);
 
 void realpanic(const char *str, ...)
 {
@@ -120,10 +123,91 @@ void realpanic(const char *str, ...)
 
 void *ramdisk_buf = NULL;
 uint32_t ramdisk_size = 0;
+uint8_t *loader_xfer_recv_data = NULL;
+uint32_t loader_xfer_recv_count = 0;
 void *gEntryPoint;
 boot_args *gBootArgs;
 
 static boot_args BootArgs;
+
+static void dump_patched_kernel(int input_fd, uint32_t fatoff, void *mem,
+                                uintptr_t lowest, mach_hdr_t *hdr,
+                                const char *path)
+{
+    struct stat st;
+    if(fstat(input_fd, &st) != 0)
+    {
+        fprintf(stderr, "fstat(dump input): %s\n", strerror(errno));
+        exit(-1);
+    }
+
+    int output_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if(output_fd == -1)
+    {
+        fprintf(stderr, "open(%s): %s\n", path, strerror(errno));
+        exit(-1);
+    }
+    if(ftruncate(output_fd, st.st_size) != 0)
+    {
+        fprintf(stderr, "ftruncate(%s): %s\n", path, strerror(errno));
+        exit(-1);
+    }
+
+    uint8_t copy_buf[0x10000];
+    for(off_t offset = 0; offset < st.st_size;)
+    {
+        size_t left = (size_t)(st.st_size - offset);
+        size_t chunk = left < sizeof(copy_buf) ? left : sizeof(copy_buf);
+        ssize_t nr = pread(input_fd, copy_buf, chunk, offset);
+        if(nr <= 0)
+        {
+            fprintf(stderr, "pread(%s): %s\n", path, nr < 0 ? strerror(errno) : "unexpected EOF");
+            exit(-1);
+        }
+        for(ssize_t written = 0; written < nr;)
+        {
+            ssize_t nw = pwrite(output_fd, copy_buf + written,
+                                (size_t)(nr - written), offset + written);
+            if(nw <= 0)
+            {
+                fprintf(stderr, "pwrite(%s): %s\n", path, strerror(errno));
+                exit(-1);
+            }
+            written += nw;
+        }
+        offset += nr;
+    }
+
+    for(mach_lc_t *cmd = (mach_lc_t*)(hdr + 1),
+                  *end = (mach_lc_t*)((uintptr_t)cmd + hdr->sizeofcmds);
+        cmd < end;
+        cmd = (mach_lc_t*)((uintptr_t)cmd + cmd->cmdsize))
+    {
+        if(cmd->cmd != MACH_SEGMENT) continue;
+        mach_seg_t *seg = (mach_seg_t*)cmd;
+        if(seg->filesize == 0) continue;
+        const uint8_t *src = (const uint8_t*)mem + (seg->vmaddr - lowest);
+        for(uint64_t written = 0; written < seg->filesize;)
+        {
+            ssize_t nw = pwrite(output_fd, src + written,
+                                (size_t)(seg->filesize - written),
+                                fatoff + seg->fileoff + written);
+            if(nw <= 0)
+            {
+                fprintf(stderr, "pwrite(%s, %.16s): %s\n",
+                        path, seg->segname, strerror(errno));
+                exit(-1);
+            }
+            written += (uint64_t)nw;
+        }
+    }
+    if(close(output_fd) != 0)
+    {
+        fprintf(stderr, "close(%s): %s\n", path, strerror(errno));
+        exit(-1);
+    }
+    printf("Dumped patched kernel to %s\n", path);
+}
 
 #define NUM_JIT 1
 static struct {
@@ -141,9 +225,95 @@ void command_register(const char* name, const char* desc, void (*cb)(const char*
     // nop
 }
 
+static struct
+{
+    void *ptr;
+    uint32_t size;
+    uint64_t paddr;
+} test_static_allocs[16];
+static size_t test_static_alloc_count = 0;
+static uint64_t test_static_next_paddr = 0x808000000ULL;
+
 void* alloc_static(uint32_t size)
 {
-    return malloc(size);
+    if(test_static_alloc_count >= sizeof(test_static_allocs) / sizeof(test_static_allocs[0]))
+    {
+        realpanic("too many kpf-test static allocations");
+    }
+
+    void *ptr = malloc(size);
+    if(!ptr)
+    {
+        realpanic("kpf-test static allocation failed");
+    }
+
+    uint64_t paddr = (test_static_next_paddr + 0x3fff) & ~0x3fffULL;
+    test_static_allocs[test_static_alloc_count++] = (typeof(test_static_allocs[0]))
+    {
+        .ptr = ptr,
+        .size = size,
+        .paddr = paddr,
+    };
+    test_static_next_paddr = paddr + ((size + 0x3fff) & ~0x3fffULL);
+    return ptr;
+}
+
+uint64_t vatophys_static(void *kva)
+{
+    uintptr_t address = (uintptr_t)kva;
+    for(size_t i = 0; i < test_static_alloc_count; ++i)
+    {
+        uintptr_t base = (uintptr_t)test_static_allocs[i].ptr;
+        if(address >= base && address - base < test_static_allocs[i].size)
+        {
+            return test_static_allocs[i].paddr + (address - base);
+        }
+    }
+    realpanic("kpf-test vatophys_static input is not an alloc_static pointer");
+    return 0;
+}
+
+static void load_overlay_for_test(const char *path)
+{
+    int fd = open(path, O_RDONLY);
+    if(fd == -1)
+    {
+        fprintf(stderr, "open overlay %s: %s\n", path, strerror(errno));
+        exit(-1);
+    }
+
+    struct stat st;
+    if(fstat(fd, &st) != 0 || st.st_size <= 0 || (uint64_t)st.st_size > UINT32_MAX)
+    {
+        fprintf(stderr, "invalid overlay %s\n", path);
+        exit(-1);
+    }
+
+    loader_xfer_recv_data = malloc((size_t)st.st_size);
+    if(!loader_xfer_recv_data)
+    {
+        fprintf(stderr, "malloc overlay: %s\n", strerror(errno));
+        exit(-1);
+    }
+
+    for(off_t offset = 0; offset < st.st_size;)
+    {
+        ssize_t nr = read(fd, loader_xfer_recv_data + offset,
+                          (size_t)(st.st_size - offset));
+        if(nr <= 0)
+        {
+            fprintf(stderr, "read overlay %s: %s\n", path,
+                    nr < 0 ? strerror(errno) : "unexpected EOF");
+            exit(-1);
+        }
+        offset += nr;
+    }
+    close(fd);
+
+    loader_xfer_recv_count = (uint32_t)st.st_size;
+    kpf_overlay_cmd("overlay", NULL);
+    printf("Loaded KPF test overlay %s (0x%x bytes)\n", path,
+           (uint32_t)st.st_size);
 }
 
 void invalidate_icache(void)
@@ -413,6 +583,22 @@ static void __attribute__((noreturn)) process_kernel(int fd)
     BootArgs.Revision           = 0x1337;
     BootArgs.Version            = 0x1469;
     BootArgs.virtBase           = lowest;
+    const char *slide_string = getenv("KPF_TEST_SLIDE");
+    uint64_t test_slide = 0;
+    if(slide_string && slide_string[0] != '\0')
+    {
+        char *slide_end = NULL;
+        errno = 0;
+        test_slide = strtoull(slide_string, &slide_end, 0);
+        if(errno != 0 || !slide_end || slide_end[0] != '\0' ||
+           (test_slide & 0x3fff) != 0)
+        {
+            fprintf(stderr, "Invalid KPF_TEST_SLIDE: %s\n", slide_string);
+            exit(-1);
+        }
+        BootArgs.virtBase += test_slide;
+        printf("Applying synthetic fileset slide 0x%llx\n", test_slide);
+    }
     BootArgs.physBase           = (uint64_t)mem;
     BootArgs.memSize            = mlen;
     BootArgs.topOfKernelData    = (uint64_t)mem + mlen;
@@ -423,11 +609,49 @@ static void __attribute__((noreturn)) process_kernel(int fd)
     gBootArgs = &BootArgs;
     gEntryPoint = (void*)((uintptr_t)mem + (entry - lowest));
 
+    if(hdr->filetype == MH_FILESET)
+    {
+        if(xnu_va_to_ptr(lowest + test_slide) != mem)
+        {
+            fprintf(stderr, "fileset VA-to-pointer baseline mismatch\n");
+            exit(-1);
+        }
+
+        uint64_t phys_base = BootArgs.physBase;
+        BootArgs.physBase += 0x4000;
+        for(mach_lc_t *cmd = (mach_lc_t*)(hdr + 1), *end = (mach_lc_t*)((uintptr_t)cmd + hdr->sizeofcmds); cmd < end; cmd = (mach_lc_t*)((uintptr_t)cmd + cmd->cmdsize))
+        {
+            if(cmd->cmd == MACH_SEGMENT)
+            {
+                mach_seg_t *seg = (mach_seg_t*)cmd;
+                if(seg->filesize &&
+                   xnu_ptr_to_va((uint8_t*)mem + seg->fileoff) != seg->vmaddr + test_slide)
+                {
+                    fprintf(stderr, "fileset pointer-to-VA inverse mismatch: %.16s\n", seg->segname);
+                    exit(-1);
+                }
+            }
+        }
+        BootArgs.physBase = phys_base;
+        printf("Fileset pointer-to-VA inverse passed with independent container and physBase\n");
+    }
+
     printf("Kernel at 0x%llx, entry at 0x%llx", (uint64_t)mem, (uint64_t)gEntryPoint);
     palera1n_flags = palerain_option_rootful;
 
     module_entry();
+    const char *overlay_path = getenv("KPF_TEST_OVERLAY");
+    if(overlay_path && overlay_path[0] != '\0')
+    {
+        load_overlay_for_test(overlay_path);
+    }
     preboot_hook();
+
+    const char *dump_path = getenv("KPF_TEST_DUMP");
+    if(dump_path && dump_path[0] != '\0')
+    {
+        dump_patched_kernel(fd, fatoff, mem, lowest, hdr, dump_path);
+    }
 
     exit(0);
 }

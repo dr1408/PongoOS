@@ -144,6 +144,8 @@ static void kpf_fsctl_dev_by_role_patch(xnu_pf_patchset_t *xnu_text_exec_patchse
 }
 #endif
 
+static bool found_shared_region_root_dir = false;
+
 static bool kpf_shared_region_root_dir_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
 {
     uint32_t *ldr = opcode_stream + 2;
@@ -195,7 +197,6 @@ static bool kpf_shared_region_root_dir_callback(struct xnu_pf_patch *patch, uint
     }
 
     // Now that we're sure this is the right match, enforce uniqueness.
-    static bool found_shared_region_root_dir = false;
     if(found_shared_region_root_dir)
     {
         panic("kpf_shared_region_root_dir: Found twice");
@@ -205,6 +206,23 @@ static bool kpf_shared_region_root_dir_callback(struct xnu_pf_patch *patch, uint
     found_shared_region_root_dir = true;
 
     puts("KPF: Found shared region root dir");
+    return true;
+}
+
+static bool kpf_shared_region_root_dir_fileset_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    if(found_shared_region_root_dir)
+    {
+        panic("kpf_shared_region_root_dir: Found twice");
+    }
+
+    // New fileset kernels pass the root shared-region identity as x7 to an
+    // internal helper.  The helper resolves the candidate identity into x0,
+    // reloads the saved x7 into x8, and rejects a mismatch.
+    opcode_stream[3] = 0xeb00001f; // cmp x0, x0
+    found_shared_region_root_dir = true;
+
+    puts("KPF: Found shared region root dir (fileset)");
     return true;
 }
 
@@ -250,7 +268,31 @@ static void kpf_shared_region_root_dir_patch(xnu_pf_patchset_t *xnu_text_exec_pa
         0xfffffc1f,
         0xffffffff,
     };
-    xnu_pf_maskmatch(xnu_text_exec_patchset, "shared_region_root_dir", matches, masks, sizeof(matches)/sizeof(uint64_t), true, (void*)kpf_shared_region_root_dir_callback);
+    xnu_pf_maskmatch(xnu_text_exec_patchset, "shared_region_root_dir_legacy", matches, masks, sizeof(matches)/sizeof(uint64_t), false, (void*)kpf_shared_region_root_dir_callback);
+
+    // arm64e fileset variant:
+    // bl resolve_candidate_identity
+    // cbz x0, ...
+    // ldr x8, [sp, ...]       ; saved root identity (incoming x7)
+    // cmp x8, x0
+    // b.ne reject
+    uint64_t fileset_matches[] =
+    {
+        0x94000000,
+        0xb4000000,
+        0xf94003e8,
+        0xeb00011f,
+        0x54000001,
+    };
+    uint64_t fileset_masks[] =
+    {
+        0xfc000000,
+        0xff00001f,
+        0xffc003ff,
+        0xffffffff,
+        0xff00001f,
+    };
+    xnu_pf_maskmatch(xnu_text_exec_patchset, "shared_region_root_dir_fileset", fileset_matches, fileset_masks, sizeof(fileset_matches)/sizeof(uint64_t), false, (void*)kpf_shared_region_root_dir_fileset_callback);
 }
 
 static void kpf_bindfs_patches(xnu_pf_patchset_t *xnu_text_exec_patchset)
@@ -283,6 +325,11 @@ static void kpf_bindfs_init(struct mach_header_64 *hdr, xnu_pf_range_t *cstring)
 
 static void kpf_bindfs_finish(struct mach_header_64 *hdr)
 {
+    if(do_bind_mounts && !found_shared_region_root_dir)
+    {
+        panic("Missing patch: shared_region_root_dir");
+    }
+
     // Signal to ramdisk whether we can have union mounts
     if (do_bind_mounts)
         palera1n_flags |= palerain_option_bind_mount;

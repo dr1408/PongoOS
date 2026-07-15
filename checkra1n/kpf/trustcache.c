@@ -32,48 +32,16 @@
 #include <stdint.h>
 #include <stdio.h>
 
-static bool found_trustcache = false;
-
-static bool kpf_trustcache_old_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
-{
-    if(found_trustcache)
-    {
-        panic("kpf_trustcache: Found more then one trustcache call");
-    }
-    found_trustcache = true;
-
-    uint32_t *bl = opcode_stream - 1;
-    if((*bl & 0xffff03f0) == 0xaa0003f0) // mov x{16-31}, x0
-    {
-        --bl;
-    }
-    if((*bl & 0xfc000000) != 0x94000000) // bl
-    {
-        panic_at(bl, "kpf_trustcache: Missing bl");
-    }
-
-    // Follow the call
-    uint32_t *lookup_in_static_trust_cache = follow_call(bl);
-    // Skip any redirects
-    while((*lookup_in_static_trust_cache & 0xfc000000) == 0x14000000)
-    {
-        lookup_in_static_trust_cache = follow_call(lookup_in_static_trust_cache);
-    }
-    // We legit, trust me bro.
-    lookup_in_static_trust_cache[0] = 0xd2802020; // movz x0, 0x101
-    lookup_in_static_trust_cache[1] = RET;
-
-    puts("KPF: Found trustcache");
-    return true;
-}
+static bool found_amfi_trustcache = false;
+static bool found_ppl_trustcache = false;
 
 static bool kpf_trustcache_new_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
 {
-    if(found_trustcache)
+    if(found_amfi_trustcache)
     {
         panic("kpf_trustcache: Found more then one trustcache func");
     }
-    found_trustcache = true;
+    found_amfi_trustcache = true;
 
     // Seek backwards to start of func. This func uses local stack space,
     // so we should always have a "sub sp, sp, 0x..." instruction.
@@ -83,41 +51,94 @@ static bool kpf_trustcache_new_callback(struct xnu_pf_patch *patch, uint32_t *op
         panic_at(opcode_stream, "kpf_trustcache: Failed to find start of function");
     }
 
-    // Just replace the entire func, no prisoners today.
-    start[0] = 0xd2800020; // mov x0, 1
-    start[1] = 0xb4000042; // cbz x2, .+0x8
-    start[2] = 0xf9000040; // str x0, [x2]
-    start[3] = RET;        // ret
+    if(start[-1] != 0xd503237f) // pacibsp
+    {
+        panic_at(start, "kpf_trustcache: missing arm64e entry PAC");
+    }
+
+    // Replace the true entry, including pacibsp. LR remains unsigned, so the
+    // replacement returns with an ordinary RET.
+    start[-1] = 0xd2800020; // mov x0, 1
+    start[0]  = 0xb4000042; // cbz x2, .+0x8
+    start[1]  = 0xf9000040; // str x0, [x2]
+    start[2]  = RET;        // ret
 
     puts("KPF: Found trustcache");
     return true;
 }
 
-static void kpf_trustcache_patches(xnu_pf_patchset_t *amfi_text_exec_patchset)
+static bool kpf_ppl_trustcache_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
 {
-    // This patch leads to AMFI believing that everything is in trustcache.
-    // This is done by searching for the sequence below:
-    //
-    // 0xfffffff0057c3f30      92440094       bl pmap_lookup_in_static_trust_cache
-    // 0xfffffff0057c3f34      28208052       mov w8, 0x101
-    // 0xfffffff0057c3f38      1f01206a       bics wzr, w8, w0
-    //
-    // When searching with r2, just make sure to set bounds to AMFI __TEXT_EXEC.
-    // /x 28208052
-    uint64_t matches_old[] =
+    if(found_ppl_trustcache)
     {
-        0x52802028, // mov w8, 0x101
+        panic("kpf_ppl_trustcache: Found more than one loaded trustcache decision");
+    }
+
+    // Exact T8020 PPL helper contract:
+    //
+    //   copy the 20-byte CodeDirectory hash to the local safe buffer
+    //   query kTCQueryTypeLoadable (2)
+    //   return query_result == KERN_SUCCESS
+    //
+    // Keep the query, frame, stack canary and RETAB intact. Only change the
+    // boolean policy result so the caller remains the owner of trust state 9
+    // (PMAP_CS_IN_LOADED_TRUST_CACHE).
+    if(opcode_stream[-4] != 0x3dc00000 || // ldr q0, [x0]
+       opcode_stream[-3] != 0x3d8003e0 || // str q0, [sp]
+       opcode_stream[-2] != 0xb9401008 || // ldr w8, [x0, #0x10]
+       opcode_stream[-1] != 0xb90013e8 || // str w8, [sp, #0x10]
+       opcode_stream[5]  != 0x1a9f17e0)  // cset w0, eq
+    {
+        return false;
+    }
+
+    uint32_t *frame = find_prev_insn(opcode_stream, 16, 0xd10003ff, 0xffc003ff);
+    if(!frame || frame[-1] != 0xd503237f) // pacibsp
+    {
+        panic_at(opcode_stream, "kpf_ppl_trustcache: missing arm64e entry PAC/frame");
+    }
+
+    uint32_t *epilogue = find_next_insn(opcode_stream + 6, 16, 0xd65f0fff, 0xffffffff);
+    if(!epilogue)
+    {
+        panic_at(opcode_stream, "kpf_ppl_trustcache: missing RETAB");
+    }
+
+    opcode_stream[5] = 0x52800020; // mov w0, #1
+    found_ppl_trustcache = true;
+    xnu_pf_disable_patch(patch);
+    puts("KPF: Found PPL loaded trustcache decision");
+    return true;
+}
+
+static void kpf_ppl_trustcache_patches(xnu_pf_patchset_t *ppl_text_patchset)
+{
+    uint64_t matches[] =
+    {
+        0x910003e1, // mov x1, sp
+        0x52800040, // mov w0, #2 (kTCQueryTypeLoadable)
+        0xd2800002, // mov x2, #0
+        0x94000000, // bl pmap_query_trust_cache_safe
+        0x7100001f, // cmp w0, #0
+        0x1a9f17e0, // cset w0, eq
     };
-    uint64_t masks_old[] =
+    uint64_t masks[] =
     {
         0xffffffff,
+        0xffffffff,
+        0xffffffff,
+        0xfc000000,
+        0xffffffff,
+        0xffffffff,
     };
-    xnu_pf_maskmatch(amfi_text_exec_patchset, "trustcache", matches_old, masks_old, sizeof(matches_old)/sizeof(uint64_t), false, (void*)kpf_trustcache_old_callback);
+    xnu_pf_maskmatch(ppl_text_patchset, "ppl_loaded_trustcache",
+        matches, masks, sizeof(matches) / sizeof(uint64_t), false,
+        (void *)kpf_ppl_trustcache_callback);
+}
 
-    // But of course, as soon as we derived this beautiful patch that worked on all versions
-    // from iOS 12.0 through 16.3, the 16.4 beta comes along and ruins it all.
-    //
-    // Use of pmap_lookup_in_static_trust_cache was replaced entirely, with this:
+static void kpf_trustcache_patches(xnu_pf_patchset_t *amfi_text_exec_patchset)
+{
+    // T8020 uses the query_trust_cache form below:
     //
     // 0xfffffff005684a34      ffc300d1       sub sp, sp, 0x30
     // 0xfffffff005684a38      f44f01a9       stp x20, x19, [sp, 0x10]
@@ -164,9 +185,13 @@ static void kpf_trustcache_patches(xnu_pf_patchset_t *amfi_text_exec_patchset)
 
 static void kpf_trustcache_finish(struct mach_header_64 *hdr)
 {
-    if(!found_trustcache)
+    if(!found_amfi_trustcache)
     {
-        panic("Missing patch: trustcache");
+        panic("Missing patch: AMFI trustcache");
+    }
+    if(!found_ppl_trustcache)
+    {
+        panic("Missing patch: PPL loaded trustcache");
     }
 }
 
@@ -175,6 +200,7 @@ kpf_component_t kpf_trustcache =
     .finish = kpf_trustcache_finish,
     .patches =
     {
+        { NULL, "__PPLTEXT", "__text", XNU_PF_ACCESS_32BIT, kpf_ppl_trustcache_patches },
         { "com.apple.driver.AppleMobileFileIntegrity", "__TEXT_EXEC", "__text", XNU_PF_ACCESS_32BIT, kpf_trustcache_patches },
         {},
     },

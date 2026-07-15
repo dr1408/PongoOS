@@ -66,8 +66,12 @@ static bool kpf_launch_constraints_callback(struct xnu_pf_patch *patch, uint32_t
         }
     }
 
-    start[0] = 0x52800000; // mov w0, 0
-    start[1] = RET;
+    if(start[-1] != 0xd503237f) // pacibsp
+    {
+        panic_at(start, "kpf_launch_constraints: missing arm64e entry PAC");
+    }
+    start[-1] = 0x52800000; // mov w0, 0, replacing pacibsp at true entry
+    start[0] = RET;         // LR was never signed
 
     puts("KPF: Found launch constraints");
     return true;
@@ -77,53 +81,15 @@ static void kpf_launch_constraints_patch(xnu_pf_patchset_t *patchset)
 {
     // Disable launch constraints.
     // We just match against a log string, seek to the start of the function, and make it return 0.
-    uint64_t matches_160[] =
-    {
-        0x90000000, // adrp x0, ...
-        0x91000000, // add x0, x0, ...
-        0xf90003f0, // str x{16-31}, [sp]
-        0x94000000, // bl IOLog
-    };
-    uint64_t masks_160[] =
-    {
-        0x9f00001f,
-        0xffc003ff,
-        0xfffffff0,
-        0xfc000000,
-    };
-    xnu_pf_maskmatch(patchset, "launch_constraints", matches_160, masks_160, sizeof(matches_160)/sizeof(uint64_t), false, (void*)kpf_launch_constraints_callback);
-
-    uint64_t matches_184[] =
-    {
-        0x90000000, // adrp x0, ...
-        0x91000000, // add x0, x0, ...
-        0xa90043f0, // stp x{16-31}, x{16-31}, [sp]
-        0x94000000, // bl IOLog
-    };
-    uint64_t masks_184[] =
-    {
-        0x9f00001f,
-        0xffc003ff,
-        0xffffc3f0,
-        0xfc000000,
-    };
-    xnu_pf_maskmatch(patchset, "launch_constraints", matches_184, masks_184, sizeof(matches_184)/sizeof(uint64_t), false, (void*)kpf_launch_constraints_callback);
-
     uint64_t matches_261b2[] =
     {
         0x90000000, // adrp x0, ...
         0x91000000, // add x0, x0, ...
-        0xa94003e0, // {ldp,ldr} ..., [sp, ...]
-        0xa90003e0, // stp x{0-15}, xN, [sp]
-        0x94000000, // bl IOLog
     };
     uint64_t masks_261b2[] =
     {
         0x9f00001f,
         0xffc003ff,
-        0xafc003e0,
-        0xffff83f0,
-        0xfc000000,
     };
     xnu_pf_maskmatch(patchset, "launch_constraints", matches_261b2, masks_261b2, sizeof(matches_261b2)/sizeof(uint64_t), false, (void*)kpf_launch_constraints_callback);
 }

@@ -36,6 +36,7 @@
 static bool need_convert_port_to_map_patch = false;
 static bool found_convert_port_to_map = false;
 
+#if 0 /* Legacy callbacks retained with the quarantined matchers below. */
 static bool kpf_convert_port_to_map_callback(struct xnu_pf_patch *patch, uint32_t *patchpoint)
 {
     // Only once
@@ -104,6 +105,44 @@ static bool kpf_convert_port_to_map_callback_260(struct xnu_pf_patch *patch, uin
 {
     return kpf_convert_port_to_map_callback(patch, opcode_stream + 6);
 }
+#endif
+
+static bool kpf_convert_port_to_map_callback_255_arm64e(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    /* Preserve both authenticated pointer loads.  Change only the decision
+     * which falls through to the kernel-pmap panic. */
+    uint32_t *branch = &opcode_stream[10];
+    uint32_t op = *branch;
+    int32_t off = sxt32(op >> 5, 19);
+    uint32_t *allowed = branch + off;
+
+    /* J305 continues through pmap_require(pmap, "pmap_require").  This is
+     * the arm64e successor of the zone_require call removed by the original
+     * mechanism.  Bind the write to its exact producer and argument ABI. */
+    if((allowed[0] & 0x9f00001f) != 0x90000001 || // adrp x1, ...
+       (allowed[1] & 0xffc003ff) != 0x91000021 || // add x1, x1, ...
+       allowed[2] != 0xaa1003e0 ||                 // mov x0, x16
+       (allowed[3] & 0xfc000000) != 0x94000000)   // bl pmap_require
+    {
+        return false;
+    }
+    const char *name = (const char *)(((uint64_t)allowed & ~0xfffULL) +
+        adrp_off(allowed[0]) + ((allowed[1] >> 10) & 0xfff));
+    if(strcmp(name, "pmap_require") != 0)
+    {
+        return false;
+    }
+    if(found_convert_port_to_map)
+    {
+        panic("kpf_convert_port_to_map: Found twice");
+    }
+
+    *branch = 0x14000000 | ((uint32_t)off & 0x03ffffff); // unconditional B
+    allowed[3] = NOP;
+    found_convert_port_to_map = true;
+    puts("KPF: Found convert_port_to_map (XNU 25.5 arm64e)");
+    return true;
+}
 
 static void kpf_convert_port_to_map_patch(xnu_pf_patchset_t *xnu_text_exec_patchset)
 {
@@ -113,7 +152,39 @@ static void kpf_convert_port_to_map_patch(xnu_pf_patchset_t *xnu_text_exec_patch
     //
     // panic(cpu 4 caller 0xfffffff007a3a57c): "userspace has control access to a "
     // "kernel map 0xfffffff0ec61a320 through task 0xffffffe19bad64f0"
+
+    uint64_t matches_255_arm64e[] = {
+        0xf2e00011, // movk x17, ..., lsl #48
+        0xdac11a30, // autda x16, x17
+        0xaa1003f1, // mov x17, x16
+        0xdac147f1, // xpacd x17
+        0xeb11021f, // cmp x16, x17
+        0x54000000, // b.eq
+        0xd4388e40, // brk #0xc472
+        0x90000008, // adrp x8, kernel_pmap
+        0x91000108, // add x8, x8, ...
+        0xeb08021f, // cmp x16, x8
+        0x54000001, // b.ne allowed
+    };
+    uint64_t masks_255_arm64e[] = {
+        0xffe0001f,
+        0xffffffff,
+        0xffffffff,
+        0xffffffff,
+        0xffffffff,
+        0xff00001f,
+        0xffffffff,
+        0x9f00001f,
+        0xffc003ff,
+        0xffffffff,
+        0xff00001f,
+    };
+    xnu_pf_maskmatch(xnu_text_exec_patchset, "convert_port_to_map", matches_255_arm64e,
+        masks_255_arm64e, sizeof(matches_255_arm64e) / sizeof(uint64_t), false,
+        (void *)kpf_convert_port_to_map_callback_255_arm64e);
     //
+/* Legacy kernelcache matchers are retained as source history only. */
+#if 0
     // Example from N69 14.0GM kernel:
     //
     // 0xfffffff00713db84      f50301aa       mov x21, x1
@@ -408,6 +479,7 @@ static void kpf_convert_port_to_map_patch(xnu_pf_patchset_t *xnu_text_exec_patch
         0xfff80010,
     };
     xnu_pf_maskmatch(xnu_text_exec_patchset, "convert_port_to_map", matches_270, masks_270, sizeof(matches_270)/sizeof(uint64_t), false, (void*)kpf_convert_port_to_map_callback);
+#endif
 }
 
 static bool found_task_conversion_eval_ldr = false;
