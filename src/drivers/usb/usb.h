@@ -42,7 +42,10 @@ struct usb_regs {
     uint64_t reg2;
     uint64_t reg3;
     int otg_irq;
+    bool (*dma_map)(uint64_t paddr, uint32_t size);
 };
+
+bool t8020_usb_dart_map(uint64_t paddr, uint32_t size);
 
 struct setup_packet {
     uint8_t  bmRequestType;
@@ -146,4 +149,4 @@ extern size_t usb_read(void *data, size_t size);
 extern size_t usb_write(const void *data, size_t size);
 extern void usb_in_transfer(uint8_t ep_addr, const void *data, uint32_t size, void (*callback)(void));
 extern void usb_out_transfer(uint8_t ep_addr, void *data, uint32_t size, void (*callback)(void *data, uint32_t size, uint32_t transferred));
-extern void usb_out_transfer_dma(uint8_t ep_addr, void *data, uint32_t dma, uint32_t size, void (*callback)(void *data, uint32_t size, uint32_t transferred));
+extern void usb_out_transfer_dma(uint8_t ep_addr, void *data, uint64_t dma, uint32_t size, void (*callback)(void *data, uint32_t size, uint32_t transferred));

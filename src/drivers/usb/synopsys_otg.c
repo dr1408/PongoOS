@@ -1289,6 +1289,7 @@ static struct control_transfer_state ep0;
 // State for other endpoints.
 struct transfer_state ep1;
 struct transfer_state ep2;
+static bool (*usb_dma_map)(uint64_t paddr, uint32_t size);
 
 // You may try to send more data than was requested, but the request will be truncated to the size
 // requested by the host.
@@ -1376,7 +1377,7 @@ usb_out_transfer(uint8_t ep_addr, void *data, uint32_t size,
 }
 
 void
-usb_out_transfer_dma(uint8_t ep_addr, void *data, uint32_t dma, uint32_t size,
+usb_out_transfer_dma(uint8_t ep_addr, void *data, uint64_t dma, uint32_t size,
         void (*callback)(void *, uint32_t, uint32_t)) {
     USB_DEBUG(USB_DEBUG_APP, "%s(%u)", __func__, size);
     struct endpoint_state *ep = NULL;
@@ -1388,8 +1389,11 @@ usb_out_transfer_dma(uint8_t ep_addr, void *data, uint32_t dma, uint32_t size,
     if (state->out_transfer_done != NULL) {
         BUG(0x636220736574);    // 'cb set'
     }
+    if (usb_dma_map && !usb_dma_map(dma, size)) {
+        panic("Failed to establish direct USB DMA mapping");
+    }
     state->out_transfer_done = callback;
-    ep_out_recv_data_dma(ep, data, dma, size);
+    ep_out_recv_data_dma(ep, data, (uint32_t)dma, size);
 }
 
 // ---- USB interrupt handling --------------------------------------------------------------------
@@ -1814,7 +1818,6 @@ void usb_main(void) {
 }
 
 static uint64_t reg1=0, reg2=0, reg3=0;
-
 static void usb_bringup(dt_node_t *otgphyctrl)
 {
     // Get these before we touch HW
@@ -1839,6 +1842,13 @@ static void usb_bringup(dt_node_t *otgphyctrl)
         case 0x8015:
             *(volatile uint32_t*)(gSynopsysComplexBase + 0x00) = 1;
             *(volatile uint32_t*)(gSynopsysComplexBase + 0x48) = 0x3000088;
+            break;
+
+        case 0x8020:
+            *(volatile uint32_t*)(gSynopsysComplexBase + 0x00) = 1;
+            *(volatile uint32_t*)(gSynopsysComplexBase + 0x28) = usb_dma_map ? 0 : 0x3000088;
+            *(volatile uint32_t*)(gSynopsysComplexBase + 0x38) = usb_dma_map ? 0 : 0x3000088;
+            *(volatile uint32_t*)(gSynopsysComplexBase + 0x48) = usb_dma_map ? 0 : 0x3000088;
             break;
 
         default:
@@ -1911,6 +1921,7 @@ void usb_init(void)
     reg2 = gIOBase + regs.reg2;
     reg3 = gIOBase + regs.reg3;
     uint32_t otg_irq = regs.otg_irq;
+    usb_dma_map = regs.dma_map;
 
     uint64_t dma_page_v = (uint64_t) alloc_contig(4 * DMA_BUFFER_SIZE);
     uint64_t dma_page_p = vatophys_static((void*)dma_page_v);
@@ -1922,6 +1933,10 @@ void usb_init(void)
     usb_irq_mode = 1;
     usb_usbtask_handoff_mode = 0;
     usb_bringup(otgphyctrl);
+
+    if (usb_dma_map && !usb_dma_map(dma_page_p, 4 * DMA_BUFFER_SIZE)) {
+        panic("Failed to establish USB DMA mapping");
+    }
 
     gSynopsysCoreVersion = reg_read(rGSNPSID) & 0xffff;
     USB_DEBUG(USB_DEBUG_STANDARD, "gSynopsysCoreVersion: 0x%x", gSynopsysCoreVersion);
