@@ -224,12 +224,23 @@ _pf_jit_iter_loop_end_end:
 
 .align 3
 _pf_jit_ptr_comparison_start:
+    cbz x2, _pf_jit_ptr_comparison_fileset
     orr x8, x20, x2
     add x8, x8, x3
+    b _pf_jit_ptr_comparison_decoded
+_pf_jit_ptr_comparison_fileset:
+    tbnz x20, #63, _pf_jit_ptr_comparison_fileset_auth
+    ubfx x8, x20, #0, #43
+    b _pf_jit_ptr_comparison_fileset_base
+_pf_jit_ptr_comparison_fileset_auth:
+    mov w8, w20
+_pf_jit_ptr_comparison_fileset_base:
+    add x8, x8, x3
+_pf_jit_ptr_comparison_decoded:
     cmp x8, x0
     b.lo _pf_jit_ptr_comparison_next
     cmp x8, x1
-    b.hi _pf_jit_ptr_comparison_next
+    b.hs _pf_jit_ptr_comparison_next
     ldr x0, _pf_jit_ptr_comparison_patch
     mov w1, w29
     sub x2, x19, #0x40

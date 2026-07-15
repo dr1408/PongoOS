@@ -523,6 +523,8 @@ PONGO_EXPORT(xnu_platform);
 PONGO_EXPORT(xnu_va_to_ptr);
 PONGO_EXPORT(xnu_ptr_to_va);
 PONGO_EXPORT(xnu_rebase_va);
+PONGO_EXPORT(xnu_fileset_decode_rebase);
+PONGO_EXPORT(xnu_fileset_retarget_auth_rebase);
 PONGO_EXPORT(kext_rebase_va);
 PONGO_EXPORT(xnu_pf_range_from_va);
 PONGO_EXPORT(xnu_pf_segment);
