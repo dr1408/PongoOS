@@ -39,7 +39,12 @@ static inline void put_dockchannel_modifier(const char* str) {
 
 void dockchannel_init(void)
 {
-    if (socnum != 0x8012)
+    /*
+     * T8020 iBoot uses the same dockchannel UART register interface as T8012:
+     * TX data at +0x4004 and TX free count at +0x4014.  The base remains
+     * device-tree supplied because it is SoC-specific.
+     */
+    if (socnum != 0x8012 && socnum != 0x8020)
         return;
 
     dt_node_t *node = dt_get("/arm-io/dockchannel-uart");
