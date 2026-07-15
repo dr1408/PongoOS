@@ -35,7 +35,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-extern uint32_t kdi_shc[], kdi_shc_orig[], kdi_shc_get[], kdi_shc_addr[], kdi_shc_size[], kdi_shc_new[], kdi_shc_set[], kdi_shc_end[];
+extern uint32_t kdi_shc[], kdi_shc_orig[], kdi_shc_get[], kdi_shc_get_vtable_auth[],
+    kdi_shc_get_call_auth[], kdi_shc_addr[], kdi_shc_size[], kdi_shc_new[],
+    kdi_shc_set[], kdi_shc_set_vtable_auth[], kdi_shc_set_call_auth[],
+    kdi_shc_release_vtable_auth[], kdi_shc_release_call_auth[], kdi_shc_end[];
 
 static bool did_run = false;
 static bool do_patchfind = false;
@@ -46,17 +49,58 @@ static uint32_t overlay_size = 0;
 
 static uint32_t *kdi_patchpoint = NULL;
 static uint16_t OSDictionary_getObject_idx = 0, OSDictionary_setObject_idx = 0;
-static uint64_t IOMemoryDescriptor_withAddress = 0;
+static uint16_t OSDictionary_vtable_discriminator = 0;
+static uint16_t OSDictionary_getObject_discriminator = 0;
+static uint16_t OSDictionary_setObject_discriminator = 0;
+static uint16_t OSObject_vtable_discriminator = 0;
+static uint16_t OSObject_release_discriminator = 0;
+static uint64_t IOMemoryDescriptor_withPhysicalAddress = 0;
 
-static bool kpf_overlay_iomemdesc_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+static uint16_t movk_imm16(uint32_t insn)
 {
-    if(IOMemoryDescriptor_withAddress)
+    return (insn >> 5) & 0xffff;
+}
+
+static uint32_t *find_prev_movk48(uint32_t *from, size_t count, uint32_t reg)
+{
+    return find_prev_insn(from, count, 0xf2e00000 | reg, 0xffe0001f);
+}
+
+static void patch_add_imm12(uint32_t *insn, uint32_t reg, uint32_t value)
+{
+    uint32_t expected = 0x91000000 | (reg << 5) | reg;
+    if(*insn != expected || value > 0xfff)
     {
-        panic("kpf_overlay: Ambiguous callsites to IOMemoryDescriptor::withAddress");
+        panic("KDI invalid ADD placeholder/value: 0x%08x/0x%x", *insn, value);
     }
-    uint32_t *bl = opcode_stream + 2;
-    IOMemoryDescriptor_withAddress = xnu_ptr_to_va(bl) + (sxt32(*bl, 26) << 2);
-    puts("KPF: Found IOMemoryDescriptor");
+    *insn = expected | (value << 10);
+}
+
+static void patch_movk48_imm16(uint32_t *insn, uint32_t reg, uint16_t value)
+{
+    uint32_t expected = 0xf2e00000 | reg;
+    if(*insn != expected)
+    {
+        panic("KDI invalid MOVK placeholder: 0x%08x", *insn);
+    }
+    *insn = expected | ((uint32_t)value << 5);
+}
+
+static bool kpf_overlay_iomemdesc_physical_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    if(IOMemoryDescriptor_withPhysicalAddress)
+    {
+        panic("kpf_overlay: Ambiguous IOMemoryDescriptor::withPhysicalAddress implementations");
+    }
+
+    uint32_t *entry = find_prev_insn(opcode_stream, 32, 0xd503237f, 0xffffffff); // pacibsp
+    if(!entry)
+    {
+        return false;
+    }
+
+    IOMemoryDescriptor_withPhysicalAddress = xnu_ptr_to_va(entry);
+    puts("KPF: Found IOMemoryDescriptor::withPhysicalAddress");
     return true;
 }
 
@@ -64,21 +108,25 @@ static void kpf_overlay_iomemdesc(xnu_pf_patchset_t *xnu_text_exec_patchset)
 {
     uint64_t matches[] =
     {
-        0x52800601, // mov w1, 0x30
-        0x52800062, // mov w2, 3
-        0x14000000, // b IOMemoryDescriptor::withAddress
+        0x321b0265, // orr w5, w19, 0x20 (kIOMemoryTypePhysical64)
+        0xaa0003f3, // mov x19, x0
+        0x52800022, // mov w2, 1
+        0x52800003, // mov w3, 0
+        0xd2800004, // mov x4, 0 (TASK_NULL)
+        0xd2800006, // mov x6, 0
     };
     uint64_t masks[] =
     {
         0xffffffff,
         0xffffffff,
-        0xfc000000,
+        0xffffffff,
+        0xffffffff,
+        0xffffffff,
+        0xffffffff,
     };
-    xnu_pf_maskmatch(xnu_text_exec_patchset, "iomemdesc", matches, masks, sizeof(matches)/sizeof(uint64_t), false, (void*)kpf_overlay_iomemdesc_callback);
-
-    matches[0] = 0x321c07e1; // orr w1, wzr, 0x30
-    matches[1] = 0x320007e2; // orr w2, wzr, 3
-    xnu_pf_maskmatch(xnu_text_exec_patchset, "iomemdesc", matches, masks, sizeof(matches)/sizeof(uint64_t), false, (void*)kpf_overlay_iomemdesc_callback);
+    xnu_pf_maskmatch(xnu_text_exec_patchset, "iomemdesc_physical", matches, masks,
+        sizeof(matches)/sizeof(uint64_t), false,
+        (void*)kpf_overlay_iomemdesc_physical_callback);
 }
 
 static bool kpf_overlay_kdi_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
@@ -126,6 +174,83 @@ static bool kpf_overlay_kdi_callback(struct xnu_pf_patch *patch, uint32_t *opcod
     return false;
 }
 
+static bool kpf_overlay_kdi_fileset_get_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    uint64_t page = ((uint64_t)(opcode_stream + 3) & ~0xfffULL) + adrp_off(opcode_stream[3]);
+    uint32_t off = (opcode_stream[4] >> 10) & 0xfff;
+    const char *str = (const char*)(page + off);
+    if(strcmp(str, "image-secrets")) return false;
+
+    uint16_t index = ((opcode_stream[0] >> 5) & 0xffff) / sizeof(uint64_t);
+    uint32_t *autda = find_prev_insn(opcode_stream, 8, 0xdac11810, 0xfffffc1f); // autda x16, xN
+    uint32_t modifier_reg = autda ? ((*autda >> 5) & 0x1f) : 0;
+    uint32_t *vtable_movk = autda ? find_prev_movk48(autda, 4, modifier_reg) : NULL;
+    uint32_t *blraa = find_next_insn(opcode_stream + 4, 5, 0xd73f0910, 0xffffffff); // blraa x8, x16
+    uint32_t *call_movk = blraa ? find_prev_movk48(blraa, 4, 16) : NULL;
+    if(!call_movk)
+    {
+        return false;
+    }
+
+    if(!OSDictionary_getObject_idx)
+    {
+        if(!vtable_movk)
+        {
+            return false;
+        }
+        OSDictionary_getObject_idx = index;
+        OSDictionary_vtable_discriminator = movk_imm16(*vtable_movk);
+        OSDictionary_getObject_discriminator = movk_imm16(*call_movk);
+        return false;
+    }
+
+    uint32_t *bl = blraa ? find_next_insn(blraa + 1, 16, 0x94000000, 0xfc000000) : NULL;
+    if(!bl || (bl[1] & 0xff00001f) != 0xb5000000) // cbnz x0
+    {
+        return false;
+    }
+
+    kdi_patchpoint = bl;
+    if(OSDictionary_setObject_idx)
+    {
+        puts("KPF: Found KDI (fileset)");
+        return true;
+    }
+    return false;
+}
+
+static bool kpf_overlay_kdi_fileset_set_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    uint64_t page = ((uint64_t)(opcode_stream + 2) & ~0xfffULL) + adrp_off(opcode_stream[2]);
+    uint32_t off = (opcode_stream[3] >> 10) & 0xfff;
+    const char *str = (const char*)(page + off);
+    if(strcmp(str, "netboot-image")) return false;
+
+    uint32_t *set_blraa = find_next_insn(opcode_stream + 4, 12, 0xd73f0920, 0xffffffe0); // blraa x9, xN
+    uint32_t set_modifier = set_blraa ? (*set_blraa & 0x1f) : 0;
+    uint32_t *set_call_movk = set_blraa ? find_prev_movk48(set_blraa, 4, set_modifier) : NULL;
+
+    uint32_t *release_autda = set_blraa ? find_next_insn(set_blraa + 1, 12, 0xdac11a30, 0xffffffff) : NULL;
+    uint32_t *release_vtable_movk = release_autda ? find_prev_movk48(release_autda, 4, 17) : NULL;
+    uint32_t *release_blraa = release_autda ? find_next_insn(release_autda + 1, 12, 0xd73f0910, 0xffffffff) : NULL;
+    uint32_t *release_call_movk = release_blraa ? find_prev_movk48(release_blraa, 4, 16) : NULL;
+    if(!set_call_movk || !release_vtable_movk || !release_call_movk)
+    {
+        return false;
+    }
+
+    OSDictionary_setObject_idx = (opcode_stream[1] >> 10) & 0xfff;
+    OSDictionary_setObject_discriminator = movk_imm16(*set_call_movk);
+    OSObject_vtable_discriminator = movk_imm16(*release_vtable_movk);
+    OSObject_release_discriminator = movk_imm16(*release_call_movk);
+    if(kdi_patchpoint && OSDictionary_getObject_idx)
+    {
+        puts("KPF: Found KDI (fileset)");
+        return true;
+    }
+    return false;
+}
+
 static void kpf_overlay_kdi_patch(xnu_pf_patchset_t *kdi_text_exec_patchset)
 {
     uint64_t matches[] =
@@ -140,7 +265,41 @@ static void kpf_overlay_kdi_patch(xnu_pf_patchset_t *kdi_text_exec_patchset)
         0x9f00001f,
         0xffc003ff,
     };
-    xnu_pf_maskmatch(kdi_text_exec_patchset, "KDI", matches, masks, sizeof(matches)/sizeof(uint64_t), true, (void*)kpf_overlay_kdi_callback);
+    xnu_pf_maskmatch(kdi_text_exec_patchset, "KDI_legacy", matches, masks, sizeof(matches)/sizeof(uint64_t), false, (void*)kpf_overlay_kdi_callback);
+
+    uint64_t fileset_get_matches[] =
+    {
+        0xd2800011, // mov x17, vtable byte offset
+        0x8b110210, // add x16, x16, x17
+        0xf9400208, // ldr x8, [x16]
+        0x90000001, // adrp x1, string
+        0x91000021, // add x1, x1, string offset
+    };
+    uint64_t fileset_get_masks[] =
+    {
+        0xff80001f,
+        0xffffffff,
+        0xffffffff,
+        0x9f00001f,
+        0xffc003ff,
+    };
+    xnu_pf_maskmatch(kdi_text_exec_patchset, "KDI_fileset_get", fileset_get_matches, fileset_get_masks, sizeof(fileset_get_matches)/sizeof(uint64_t), false, (void*)kpf_overlay_kdi_fileset_get_callback);
+
+    uint64_t fileset_set_matches[] =
+    {
+        0x91000208, // add x8, x16, vtable byte offset
+        0xf9400209, // ldr x9, [x16, same offset]
+        0x90000001, // adrp x1, string
+        0x91000021, // add x1, x1, string offset
+    };
+    uint64_t fileset_set_masks[] =
+    {
+        0xffc003ff,
+        0xffc003ff,
+        0x9f00001f,
+        0xffc003ff,
+    };
+    xnu_pf_maskmatch(kdi_text_exec_patchset, "KDI_fileset_set", fileset_set_matches, fileset_set_masks, sizeof(fileset_set_matches)/sizeof(uint64_t), false, (void*)kpf_overlay_kdi_fileset_set_callback);
 }
 
 static void kpf_overlay_xnu_patches(xnu_pf_patchset_t *xnu_text_exec_patchset)
@@ -175,6 +334,14 @@ static void kpf_overlay_init(struct mach_header_64 *hdr, xnu_pf_range_t *cstring
 
 static void kpf_overlay_finish(struct mach_header_64 *hdr)
 {
+    if(do_patchfind && (!kdi_patchpoint || !OSDictionary_getObject_idx ||
+        !OSDictionary_setObject_idx || !OSDictionary_vtable_discriminator ||
+        !OSDictionary_getObject_discriminator || !OSDictionary_setObject_discriminator ||
+        !OSObject_vtable_discriminator || !OSObject_release_discriminator))
+    {
+        panic("Missing patch: KDI");
+    }
+
     if (do_shellcode)
         palera1n_flags |= palerain_option_overlay;
 }
@@ -192,7 +359,7 @@ static uint32_t kpf_overlay_size(void)
 static uint32_t kpf_overlay_emit(uint32_t *shellcode_area)
 {
     // Check this here, before we decide whether to actually emit shellcode.
-    if(do_patchfind && !IOMemoryDescriptor_withAddress)
+    if(do_patchfind && !IOMemoryDescriptor_withPhysicalAddress)
     {
         panic("Missing patch: IOMemoryDescriptor");
     }
@@ -206,7 +373,7 @@ static uint32_t kpf_overlay_emit(uint32_t *shellcode_area)
     printf("Allocated static region for overlay: %p, sz: 0x%x\n", ov_static_buf, overlay_size);
     memcpy(ov_static_buf, overlay_buf, overlay_size);
 
-    uint64_t overlay_addr = xnu_ptr_to_va(ov_static_buf);
+    uint64_t overlay_paddr = vatophys_static(ov_static_buf);
     uint64_t shellcode_addr = xnu_ptr_to_va(shellcode_area);
     uint64_t patchpoint_addr = xnu_ptr_to_va(kdi_patchpoint);
     uint64_t orig_func = patchpoint_addr + (sxt32(*kdi_patchpoint, 26) << 2);
@@ -214,12 +381,18 @@ static uint32_t kpf_overlay_emit(uint32_t *shellcode_area)
     size_t orig_idx = kdi_shc_orig - kdi_shc;
     size_t get_idx  = kdi_shc_get  - kdi_shc;
     size_t set_idx  = kdi_shc_set  - kdi_shc;
+    size_t get_vtable_auth_idx = kdi_shc_get_vtable_auth - kdi_shc;
+    size_t get_call_auth_idx = kdi_shc_get_call_auth - kdi_shc;
+    size_t set_vtable_auth_idx = kdi_shc_set_vtable_auth - kdi_shc;
+    size_t set_call_auth_idx = kdi_shc_set_call_auth - kdi_shc;
+    size_t release_vtable_auth_idx = kdi_shc_release_vtable_auth - kdi_shc;
+    size_t release_call_auth_idx = kdi_shc_release_call_auth - kdi_shc;
     size_t new_idx  = kdi_shc_new  - kdi_shc;
     size_t addr_idx = kdi_shc_addr - kdi_shc;
     size_t size_idx = kdi_shc_size - kdi_shc;
 
     int64_t orig_off  = orig_func - (shellcode_addr + (orig_idx << 2));
-    int64_t new_off   = IOMemoryDescriptor_withAddress - (shellcode_addr + (new_idx << 2));
+    int64_t new_off   = IOMemoryDescriptor_withPhysicalAddress - (shellcode_addr + (new_idx << 2));
     int64_t patch_off = shellcode_addr - patchpoint_addr;
     if(orig_off > 0x7fffffcLL || orig_off < -0x8000000LL || new_off > 0x7fffffcLL || new_off < -0x8000000LL || patch_off > 0x7fffffcLL || patch_off < -0x8000000LL)
     {
@@ -229,13 +402,27 @@ static uint32_t kpf_overlay_emit(uint32_t *shellcode_area)
     memcpy(shellcode_area, kdi_shc, (uintptr_t)kdi_shc_end - (uintptr_t)kdi_shc);
 
     shellcode_area[orig_idx] |= (orig_off >> 2) & 0x03ffffff;
-    shellcode_area[get_idx]  |= OSDictionary_getObject_idx << 10;
-    shellcode_area[set_idx]  |= OSDictionary_setObject_idx << 10;
+    patch_add_imm12(&shellcode_area[get_idx], 16,
+        OSDictionary_getObject_idx * sizeof(uint64_t));
+    patch_add_imm12(&shellcode_area[set_idx], 16,
+        OSDictionary_setObject_idx * sizeof(uint64_t));
+    patch_movk48_imm16(&shellcode_area[get_vtable_auth_idx], 17,
+        OSDictionary_vtable_discriminator);
+    patch_movk48_imm16(&shellcode_area[get_call_auth_idx], 16,
+        OSDictionary_getObject_discriminator);
+    patch_movk48_imm16(&shellcode_area[set_vtable_auth_idx], 17,
+        OSDictionary_vtable_discriminator);
+    patch_movk48_imm16(&shellcode_area[set_call_auth_idx], 17,
+        OSDictionary_setObject_discriminator);
+    patch_movk48_imm16(&shellcode_area[release_vtable_auth_idx], 17,
+        OSObject_vtable_discriminator);
+    patch_movk48_imm16(&shellcode_area[release_call_auth_idx], 16,
+        OSObject_release_discriminator);
     shellcode_area[new_idx]  |= (new_off >> 2) & 0x03ffffff;
-    shellcode_area[addr_idx + 0] |= ((overlay_addr >> 48) & 0xffff) << 5;
-    shellcode_area[addr_idx + 1] |= ((overlay_addr >> 32) & 0xffff) << 5;
-    shellcode_area[addr_idx + 2] |= ((overlay_addr >> 16) & 0xffff) << 5;
-    shellcode_area[addr_idx + 3] |= ((overlay_addr >>  0) & 0xffff) << 5;
+    shellcode_area[addr_idx + 0] |= ((overlay_paddr >> 48) & 0xffff) << 5;
+    shellcode_area[addr_idx + 1] |= ((overlay_paddr >> 32) & 0xffff) << 5;
+    shellcode_area[addr_idx + 2] |= ((overlay_paddr >> 16) & 0xffff) << 5;
+    shellcode_area[addr_idx + 3] |= ((overlay_paddr >>  0) & 0xffff) << 5;
     shellcode_area[size_idx + 0] |= ((overlay_size >> 16) & 0xffff) << 5;
     shellcode_area[size_idx + 1] |= ((overlay_size >>  0) & 0xffff) << 5;
 

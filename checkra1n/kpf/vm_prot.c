@@ -28,6 +28,70 @@
 #include "kpf.h"
 #include <xnu/xnu.h>
 
+static bool found_ppl_debugger_mapping = false;
+
+static bool
+kpf_ppl_debugger_mapping_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    /*
+     * T8020 ppl_associate_debug_region() inlines
+     * IOCurrentTaskHasEntitlement().  The authenticated call below is the
+     * OSEntitlements.queryEntitlementBooleanWithProc() vtable call, whose ABI
+     * returns kern_return_t: KERN_SUCCESS (zero) means that the boolean
+     * entitlement exists and is true.
+     *
+     * Keep the task/proc lookup, authenticated entitlement query, COW
+     * association, and PPL call intact.  Change only the branch which rejects
+     * a nonzero query result.
+     */
+    if(found_ppl_debugger_mapping)
+    {
+        panic("kpf_ppl_debugger_mapping: Found more than one entitlement gate");
+    }
+
+    if(opcode_stream[0] != 0xf940e108 ||                 // ldr x8, [x8, #0x1c0]
+       (opcode_stream[1] & 0x9f00001f) != 0x90000001 || // adrp x1, entitlement
+       (opcode_stream[2] & 0xffc003ff) != 0x91000021 || // add x1, x1, #...
+       (opcode_stream[3] & 0xffe0001f) != 0xd2800011 || // mov x17, discriminator
+       opcode_stream[4] != 0xd73f0911 ||                // blraa x8, x17
+       opcode_stream[5] != 0x34000260 ||                // cbz w0, associate_cow
+       opcode_stream[6] != 0x528006a0 ||                // mov w0, #KERN_DENIED
+       (opcode_stream[7] & 0xfc000000) != 0x14000000)   // b return
+    {
+        return false;
+    }
+
+    uint64_t entitlement_va =
+        (xnu_ptr_to_va(opcode_stream + 1) & ~0xfffULL) +
+        adrp_off(opcode_stream[1]) +
+        ((opcode_stream[2] >> 10) & 0xfff);
+    const char *entitlement = xnu_va_to_ptr(entitlement_va);
+    if(strcmp(entitlement, "com.apple.private.cs.debugger") != 0)
+    {
+        return false;
+    }
+
+    uint32_t *associate_cow = opcode_stream + 5 +
+        sxt32(opcode_stream[5] >> 5, 19);
+    if(associate_cow[0] != 0xaa1403e0 || // mov x0, x20 (pmap)
+       associate_cow[1] != 0x92800021 || // mov x1, #-2 (PMAP_CS_ASSOCIATE_COW)
+       associate_cow[2] != 0xaa1503e2 || // mov x2, x21 (region address)
+       associate_cow[3] != 0xaa1303e3 || // mov x3, x19 (region size)
+       associate_cow[4] != 0xd2800004 || // mov x4, #0
+       (associate_cow[5] & 0xfc000000) != 0x94000000 || // bl pmap_cs_associate
+       associate_cow[6] != 0x7100181f)   // cmp w0, #KERN_ABORTED
+    {
+        return false;
+    }
+
+    opcode_stream[5] = 0x14000013; // b associate_cow
+
+    found_ppl_debugger_mapping = true;
+    xnu_pf_disable_patch(patch);
+    puts("KPF: Found PPL debugger mapping entitlement gate");
+    return true;
+}
+
 #if 0
 // XXX doesn't work like this, needs new strat
 
@@ -153,10 +217,46 @@ static void kpf_aprr_patch(xnu_pf_patchset_t *xnu_text_exec_patchset)
 static void kpf_vm_prot_patches(xnu_pf_patchset_t *xnu_text_exec_patchset)
 {
     //kpf_aprr_patch(xnu_text_exec_patchset);
+
+    uint64_t matches[] =
+    {
+        0xf940e108, // ldr x8, [x8, #0x1c0]
+        0x90000001, // adrp x1, entitlement
+        0x91000021, // add x1, x1, #...
+        0xd2800011, // mov x17, discriminator
+        0xd73f0911, // blraa x8, x17
+        0x34000260, // cbz w0, associate_cow
+        0x528006a0, // mov w0, #KERN_DENIED
+        0x14000000, // b return
+    };
+    uint64_t masks[] =
+    {
+        0xffffffff,
+        0x9f00001f,
+        0xffc003ff,
+        0xffe0001f,
+        0xffffffff,
+        0xffffffff,
+        0xffffffff,
+        0xfc000000,
+    };
+    xnu_pf_maskmatch(xnu_text_exec_patchset, "ppl_debugger_mapping",
+        matches, masks, sizeof(matches) / sizeof(uint64_t), false,
+        (void *)kpf_ppl_debugger_mapping_callback);
+}
+
+static void kpf_vm_prot_finish(struct mach_header_64 *hdr)
+{
+    (void)hdr;
+    if(!found_ppl_debugger_mapping)
+    {
+        panic("Missing patch: PPL debugger mapping entitlement gate");
+    }
 }
 
 kpf_component_t kpf_vm_prot =
 {
+    .finish = kpf_vm_prot_finish,
     .patches =
     {
         { NULL, "__TEXT_EXEC", "__text", XNU_PF_ACCESS_32BIT, kpf_vm_prot_patches },

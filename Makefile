@@ -24,6 +24,7 @@
 CHECKRA1N_VERSION           ?= beta 0.12.4
 PONGO_VERSION               ?= 2.6.3-$(shell git rev-parse HEAD | cut -c1-8)
 PONGO_BUILD                 := $(shell git rev-parse HEAD)
+PONGO_SRAM_BASE             ?= 0x180000000
 
 ifdef CHECKRA1N_EXTRAVERSION
     CHECKRA1N_VERSION       := $(CHECKRA1N_VERSION)-$(CHECKRA1N_EXTRAVERSION)
@@ -113,11 +114,11 @@ endif
 
 # Pongo options
 PONGO_LD_FLAGS              ?= -static -L$(LIB)/fixup -lc -Wl,-preload -Wl,-no_uuid -Wl,-e,start -Wl,-order_file,$(SRC)/sym_order.txt -Wl,-image_base,0x100000000 -Wl,-merge_zero_fill_sections -Wl,-sectalign,__DATA,__zerofill,0x8 -Wl,-segalign,0x4000 $(PONGO_LDFLAGS)
-PONGO_CC_FLAGS              ?= -Os -moutline -DPONGO_VERSION='"$(PONGO_VERSION)"' -DPONGO_BUILD='"$(PONGO_BUILD)"' -DPONGO_PRIVATE=1 -I$(SRC)/lib -I$(INC) -Iapple-include -I$(SRC)/kernel -I$(SRC)/drivers $(PONGO_LD_FLAGS) $(PONGO_CFLAGS)
+PONGO_CC_FLAGS              ?= -Os -moutline -DPONGO_VERSION='"$(PONGO_VERSION)"' -DPONGO_BUILD='"$(PONGO_BUILD)"' -DPONGO_PRIVATE=1 -DPONGO_SRAM_BASE=$(PONGO_SRAM_BASE) -I$(SRC)/lib -I$(INC) -Iapple-include -I$(SRC)/kernel -I$(SRC)/drivers $(PONGO_LD_FLAGS) $(PONGO_CFLAGS)
 
 # KPF options
 KPF_LD_FLAGS                ?= -Wl,-kext $(KPF_LDFLAGS)
-KPF_CC_FLAGS                ?= -O3 -fvisibility=hidden -Dglobl=private_extern -DCHECKRA1N_VERSION='"$(CHECKRA1N_VERSION)"' -I$(INC) -Iapple-include -I$(SRC)/kernel -I$(SRC)/drivers -I$(SRC)/lib $(KPF_CFLAGS) $(KPF_LD_FLAGS)
+KPF_CC_FLAGS                ?= -O3 -march=armv8.3-a -fvisibility=hidden -Dglobl=private_extern -DCHECKRA1N_VERSION='"$(CHECKRA1N_VERSION)"' -I$(INC) -Iapple-include -I$(SRC)/kernel -I$(SRC)/drivers -I$(SRC)/lib $(KPF_CFLAGS) $(KPF_LD_FLAGS)
 
 PONGO_C                     := $(wildcard $(SRC)/*/*.S) $(wildcard $(SRC)/*/*/*.S) $(wildcard $(SRC)/*/*.c) $(wildcard $(SRC)/*/*/*.c) $(wildcard $(SRC)/*/*/*/*.c)
 PONGO_H                     := $(wildcard $(SRC)/*/*.h) $(wildcard $(SRC)/*/*/*.h) $(wildcard $(SRC)/*/*/*/*.h)
