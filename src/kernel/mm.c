@@ -308,7 +308,7 @@ void lowlevel_setup(uint64_t phys_off, uint64_t phys_size)
 
     ttbr0 = ttb_alloc();
     ttbr1 = ttb_alloc();
-    map_range_noflush_rwx(0x180000000, 0x180000000, 0x80000, 2, 0, false);
+    map_range_noflush_rwx(PONGO_SRAM_BASE, PONGO_SRAM_BASE, 0x80000, 2, 0, false);
     map_range_noflush_rw(0x200000000, 0x200000000, 0x100000000, 2, 0, false);
     phys_off += (pgsz-1);
     phys_off &= ~(pgsz-1);
@@ -332,7 +332,7 @@ void lowlevel_setup(uint64_t phys_off, uint64_t phys_size)
 }
 void lowlevel_set_identity(void)
 {
-    map_range_noflush_rwx(0x180000000, 0x180000000, 0x80000, 2, 0, true);
+    map_range_noflush_rwx(PONGO_SRAM_BASE, PONGO_SRAM_BASE, 0x80000, 2, 0, true);
     map_range_noflush_rwx(0x800000000ULL + g_phys_off, 0x800000000 + g_phys_off, ram_phys_size, 2, 0, true);
     flush_tlb();
 }

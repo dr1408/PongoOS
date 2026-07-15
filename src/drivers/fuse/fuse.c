@@ -172,6 +172,10 @@ void fuse_init(void)
             gFuseBase = 0x2352bc000;
             break;
 
+        case 0x8020:
+            gFuseBase = 0x23d2bc000;
+            break;
+
         default:
             panic("Fuse: Unsupported SoC");
     }

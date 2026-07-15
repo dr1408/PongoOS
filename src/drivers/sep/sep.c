@@ -30,6 +30,7 @@
 #include <recfg/recfg_soc.h>
 
 #define IRQ_T8015_SEP_INBOX_NOT_EMPTY 0x79
+#define IRQ_T8020_SEP_INBOX_NOT_EMPTY 0xa1
 // #define SEP_DEBUG
 
 struct mailbox_registers32 {
@@ -235,7 +236,7 @@ void sep_handle_msg_from_sep(union sep_message_u msg) {
         SEP_PANIC_PTR++;
         SEP_PANIC_CNT += 8;
         if ((socnum < 0x8015 && SEP_PANIC_CNT == 64) || // till A10 they send 64 bytes
-            (socnum == 0x8015 && SEP_PANIC_CNT == 400)) { // on A11 we seem to get 400
+            ((socnum == 0x8015 || socnum == 0x8020) && SEP_PANIC_CNT == 400)) {
             void hexdump(void *mem, unsigned int len);
             hexdump(&SEP_PANIC,SEP_PANIC_CNT);
             panic("SEPROM paniced; RIP");
@@ -366,7 +367,7 @@ void seprom_boot_tz0_async(void) {
     enable_interrupts();
 }
 void seprom_load_sepos(void *firmware, char mode) {
-    if(socnum == 0x8015) {
+    if(socnum == 0x8015 || socnum == 0x8020) {
         recfg_soc_lock();
     }
     disable_interrupts();
@@ -459,6 +460,9 @@ static void sep_pwned_boot_auto(void) {
         // TODO: T2 BPR?
         case 0x8015:
             bpr = 0x2352d0030;
+            break;
+        case 0x8020:
+            bpr = 0x23d2d0030;
             break;
     }
     if(bpr && (*(volatile uint32_t*)bpr & 0x1))
@@ -1119,6 +1123,7 @@ void sep_auto(const char* cmd, char* args)
         default:
             iprintf("No need to pwn SEP, just booting...\n");
         case 0x8015: // Lowkey skip the message :|
+        case 0x8020:
             tz_lockdown();
             seprom_boot_tz0();
             is_waiting_to_boot = 1;
@@ -1198,7 +1203,7 @@ void sep_setup(void)
     if(len < 16) panic("sep_setup: sep reg prop too short");
 
     uint64_t sep_reg_u = reg[0] + gIOBase;
-    if (socnum == 0x8015) {
+    if (socnum == 0x8015 || socnum == 0x8020) {
         mailboxregs64 = (volatile struct mailbox_registers64 *)(sep_reg_u + 0x8100);
         is_sep64 = 1;
     } else {
@@ -1211,9 +1216,10 @@ void sep_setup(void)
 
     struct task* sep_irq_task = task_create_extended("sep", sep_irq, TASK_IRQ_HANDLER|TASK_PREEMPT, 0);
     for (int i=0; i < len/4; i++) {
-        // XXX: we skip binding the inbox_empty irq on t8015, because it
-        // keeps firing and I don't know why, nor do I think we need it(?)
-        if (is_sep64 && ints[i] == IRQ_T8015_SEP_INBOX_NOT_EMPTY) {
+        // XXX: skip the SoC-specific inbox_empty IRQ on SEP64 platforms;
+        // it keeps firing and is not required by this driver.
+        if ((socnum == 0x8015 && ints[i] == IRQ_T8015_SEP_INBOX_NOT_EMPTY) ||
+            (socnum == 0x8020 && ints[i] == IRQ_T8020_SEP_INBOX_NOT_EMPTY)) {
             continue;
         }
         task_bind_to_irq(sep_irq_task, ints[i]);

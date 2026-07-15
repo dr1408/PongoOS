@@ -132,6 +132,21 @@ static const soccfg_t soccfg[] =
         .aes = 0x2352d0000,
         .iorvbar = (uint64_t[]){ 0x208450000, 0x208550000, 0x208050000, 0x208150000, 0x208250000, 0x208350000, 0 },
     },
+    {
+        .soc = 0x8020,
+        .aop_cfg_table       = (volatile uint32_t*)0x23d2c0200,
+        .aop_sram_base       = NULL,
+        .aop_cfg_lock        = (volatile uint32_t*)0x23d2c0214,
+        .aop_sram_lock_range = (volatile uint32_t*)0x23d000200,
+        .aop_sram_lock_set   = (volatile uint32_t*)0x23d000204,
+        .recfg_base = 0x23df00000,
+        // iBoot lays out recfg through 0x23df0d500 and the adjacent DCS
+        // workspace through 0x23df0f500; 0x23df10000 is the containing
+        // 64-KiB SRAM window's exclusive end.
+        .recfg_end  = 0x23df10000,
+        .aes = 0x23d2d0000,
+        .iorvbar = (uint64_t[]){ 0x210050000, 0x210150000, 0x210250000, 0x210350000, 0x211050000, 0x211150000, 0 },
+    },
 };
 
 static const soccfg_t *gCFG;
@@ -234,7 +249,19 @@ static int recfg_soc_w64(void *a, uint64_t *addr, uint64_t *data)
     return kRecfgSuccess;
 }
 
-static bool recfg_locked = false;
+typedef enum
+{
+    kRecfgLockOwnerNone,
+    kRecfgLockOwnerPongo,
+    kRecfgLockOwnerIBoot,
+} recfg_lock_owner_t;
+
+static recfg_lock_owner_t recfg_lock_owner = kRecfgLockOwnerNone;
+
+static bool recfg_is_locked(void)
+{
+    return recfg_lock_owner != kRecfgLockOwnerNone;
+}
 
 static uint64_t recfg_map(uint64_t seq_base, uint64_t seq_size)
 {
@@ -253,6 +280,108 @@ static uint64_t recfg_map(uint64_t seq_base, uint64_t seq_size)
     return seq_size;
 }
 
+static void recfg_soc_import_t8020_iboot_lock(void)
+{
+    if(socnum != 0x8020)
+    {
+        return;
+    }
+
+    uint32_t sram_lock = *gCFG->aop_sram_lock_set;
+    uint32_t cfg_lock = *gCFG->aop_cfg_lock;
+    if(sram_lock == 0 && cfg_lock == 0)
+    {
+        return;
+    }
+    if(sram_lock != 1 || cfg_lock != 1)
+    {
+        panic(
+            "Invalid T8020 iBoot Recfg lock state: sram=0x%x cfg=0x%x",
+            sram_lock,
+            cfg_lock
+        );
+    }
+
+    uint64_t sram_base, sram_end;
+    get_sram_bounds(&sram_base, &sram_end);
+    uint32_t lock_range = *gCFG->aop_sram_lock_range;
+    uint64_t lock_from = sram_base + ((uint64_t)(lock_range & 0x7fff) << 6);
+    uint64_t lock_to = sram_base + ((uint64_t)((lock_range >> 16) & 0x7fff) << 6) + 0x40;
+    if(lock_from < sram_base || lock_to <= lock_from || lock_to > sram_end)
+    {
+        panic(
+            "Invalid T8020 iBoot Recfg lock range: 0x%llx-0x%llx",
+            lock_from,
+            lock_to
+        );
+    }
+
+    uint64_t sram_size = sram_end - sram_base;
+    uint32_t cfg_offset = *gCFG->aop_cfg_table;
+    if((uint64_t)cfg_offset > sram_size - 8 * sizeof(uint32_t))
+    {
+        panic("Invalid T8020 iBoot Recfg table offset: 0x%x", cfg_offset);
+    }
+
+    uint64_t cfg_base = sram_base + cfg_offset;
+    uint64_t cfg_end = cfg_base + 8 * sizeof(uint32_t);
+    if(cfg_base < lock_from || cfg_end > lock_to)
+    {
+        panic(
+            "T8020 iBoot Recfg table is outside lock range: 0x%llx-0x%llx",
+            cfg_base,
+            cfg_end
+        );
+    }
+    if(recfg_map(cfg_base, cfg_end - cfg_base) < cfg_end - cfg_base)
+    {
+        panic("Failed to map T8020 iBoot Recfg table");
+    }
+
+    volatile uint32_t *table = (volatile uint32_t*)cfg_base;
+    for(size_t i = 0; i < 8; ++i)
+    {
+        uint64_t seq_base = (uint64_t)table[i] << 4;
+        if(seq_base < sram_base || seq_base > sram_end - sizeof(recfg_cmd_t))
+        {
+            panic("Invalid T8020 iBoot Recfg sequence %lu: 0x%llx", i, seq_base);
+        }
+
+        size_t seq_size = recfg_map(seq_base, sram_end - seq_base);
+        if(seq_size < sizeof(recfg_cmd_t))
+        {
+            panic("Failed to map T8020 iBoot Recfg sequence %lu", i);
+        }
+
+        size_t end_offset = 0;
+        uint64_t seq_end = seq_base + sizeof(recfg_cmd_t);
+        if(recfg_check((void*)seq_base, seq_size, &end_offset, false) == kRecfgSuccess)
+        {
+            if(end_offset > seq_size - sizeof(recfg_cmd_t))
+            {
+                panic("Invalid T8020 iBoot Recfg sequence %lu extent", i);
+            }
+            seq_end = seq_base + end_offset + sizeof(recfg_cmd_t);
+        }
+        if(seq_base < lock_from || seq_end > lock_to)
+        {
+            panic(
+                "T8020 iBoot Recfg sequence %lu is outside lock range: 0x%llx-0x%llx",
+                i,
+                seq_base,
+                seq_end
+            );
+        }
+    }
+
+    recfg_lock_owner = kRecfgLockOwnerIBoot;
+    iprintf(
+        "Imported T8020 iBoot Recfg lock: 0x%llx-0x%llx\n",
+        lock_from,
+        lock_to
+    );
+}
+
 void recfg_soc_sync(void)
 {
     // Skip A7/A8/A8X.
@@ -261,7 +390,7 @@ void recfg_soc_sync(void)
         return;
     }
     // Recfg lock: expected
-    if(recfg_locked)
+    if(recfg_is_locked())
     {
         return;
     }
@@ -319,7 +448,7 @@ void recfg_soc_lock(void)
         return;
     }
     // We've already been here
-    if(recfg_locked)
+    if(recfg_is_locked())
     {
         return;
     }
@@ -369,7 +498,7 @@ void recfg_soc_lock(void)
     }
     __asm__ volatile("dsb sy");
     iprintf("Recfg locked\n");
-    recfg_locked = true;
+    recfg_lock_owner = kRecfgLockOwnerPongo;
 }
 
 struct recfg_command
@@ -491,7 +620,7 @@ static void recfg_cmd_dump(const char *cmd, char *args)
 
 static void recfg_cmd_sync(const char *cmd, char *args)
 {
-    if(recfg_locked)
+    if(recfg_is_locked())
     {
         iprintf("Sorry, recfg sequences are already locked.\n");
         return;
@@ -501,7 +630,7 @@ static void recfg_cmd_sync(const char *cmd, char *args)
 
 static void recfg_cmd_lock(const char *cmd, char *args)
 {
-    if(recfg_locked)
+    if(recfg_is_locked())
     {
         iprintf("Recfg sequences are already locked.\n");
         return;
@@ -552,6 +681,8 @@ void recfg_soc_setup(void)
         panic("Failed to find SoC Recfg info");
     }
     gCFG = cfg;
+
+    recfg_soc_import_t8020_iboot_lock();
 
     command_register("recfg", "recfg sequences", recfg_cmd);
 }

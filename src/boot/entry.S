@@ -33,7 +33,10 @@ start:
     // x30 = next-stage binary (iBoot/KPP/XNU)
     //  x0 = argument to next stage
     adr x4, start
-    mov x5, 0x180000000
+    movz x5, ((PONGO_SRAM_BASE >> 0) & 0xffff), lsl 0
+    movk x5, ((PONGO_SRAM_BASE >> 16) & 0xffff), lsl 16
+    movk x5, ((PONGO_SRAM_BASE >> 32) & 0xffff), lsl 32
+    movk x5, ((PONGO_SRAM_BASE >> 48) & 0xffff), lsl 48
     cmp x4, x5
     b.eq L_relocated
     // Since we wanna be at the very start of SRAM, we don't need to check the direction of copying
@@ -48,7 +51,10 @@ copyloop:
     cmp x4, x6
     b.lo copyloop
     dsb sy
-    mov x5, 0x180000000
+    movz x5, ((PONGO_SRAM_BASE >> 0) & 0xffff), lsl 0
+    movk x5, ((PONGO_SRAM_BASE >> 16) & 0xffff), lsl 16
+    movk x5, ((PONGO_SRAM_BASE >> 32) & 0xffff), lsl 32
+    movk x5, ((PONGO_SRAM_BASE >> 48) & 0xffff), lsl 48
     br x5
 
 L_relocated:

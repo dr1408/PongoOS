@@ -86,6 +86,9 @@ void aes_a9_init(void)
         case 0x8015:
             gAESClockAddr = gIOBase + 0x32080240;
             break;
+        case 0x8020:
+            gAESClockAddr = gIOBase + 0x3b080228;
+            break;
         default:
             panic("AES A9: counterfeit init call");
     }
