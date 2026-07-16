@@ -176,8 +176,16 @@ static bool kpf_overlay_kdi_callback(struct xnu_pf_patch *patch, uint32_t *opcod
 
 static bool kpf_overlay_kdi_fileset_get_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
 {
-    uint64_t page = ((uint64_t)(opcode_stream + 3) & ~0xfffULL) + adrp_off(opcode_stream[3]);
-    uint32_t off = (opcode_stream[4] >> 10) & 0xfff;
+    uint32_t string_idx = 3;
+    uint32_t slot_modifier = 16;
+    if((opcode_stream[3] & 0xffffffe0) == 0xaa1003e0) // mov xN, x16
+    {
+        slot_modifier = opcode_stream[3] & 0x1f;
+        string_idx++;
+    }
+
+    uint64_t page = ((uint64_t)(opcode_stream + string_idx) & ~0xfffULL) + adrp_off(opcode_stream[string_idx]);
+    uint32_t off = (opcode_stream[string_idx + 1] >> 10) & 0xfff;
     const char *str = (const char*)(page + off);
     if(strcmp(str, "image-secrets")) return false;
 
@@ -185,9 +193,18 @@ static bool kpf_overlay_kdi_fileset_get_callback(struct xnu_pf_patch *patch, uin
     uint32_t *autda = find_prev_insn(opcode_stream, 8, 0xdac11810, 0xfffffc1f); // autda x16, xN
     uint32_t modifier_reg = autda ? ((*autda >> 5) & 0x1f) : 0;
     uint32_t *vtable_movk = autda ? find_prev_movk48(autda, 4, modifier_reg) : NULL;
-    uint32_t *blraa = find_next_insn(opcode_stream + 4, 5, 0xd73f0910, 0xffffffff); // blraa x8, x16
-    uint32_t *call_movk = blraa ? find_prev_movk48(blraa, 4, 16) : NULL;
+    uint32_t *blraa = find_next_insn(opcode_stream + string_idx + 2, 6, 0xd73f0900, 0xffffffe0); // blraa x8, xN
+    uint32_t call_modifier = blraa ? (*blraa & 0x1f) : 0;
+    uint32_t *call_movk = blraa ? find_prev_movk48(blraa, 4, call_modifier) : NULL;
     if(!call_movk)
+    {
+        return false;
+    }
+
+    // The slot address is either used in x16 directly or copied through a
+    // compiler-selected register before the discriminator is installed.
+    if(call_modifier != slot_modifier &&
+       call_movk[-1] != (0xaa0003e0 | (slot_modifier << 16) | call_modifier)) // mov xM, xSlot
     {
         return false;
     }
@@ -232,8 +249,9 @@ static bool kpf_overlay_kdi_fileset_set_callback(struct xnu_pf_patch *patch, uin
 
     uint32_t *release_autda = set_blraa ? find_next_insn(set_blraa + 1, 12, 0xdac11a30, 0xffffffff) : NULL;
     uint32_t *release_vtable_movk = release_autda ? find_prev_movk48(release_autda, 4, 17) : NULL;
-    uint32_t *release_blraa = release_autda ? find_next_insn(release_autda + 1, 12, 0xd73f0910, 0xffffffff) : NULL;
-    uint32_t *release_call_movk = release_blraa ? find_prev_movk48(release_blraa, 4, 16) : NULL;
+    uint32_t *release_blraa = release_autda ? find_next_insn(release_autda + 1, 12, 0xd73f0900, 0xffffffe0) : NULL;
+    uint32_t release_modifier = release_blraa ? (*release_blraa & 0x1f) : 0;
+    uint32_t *release_call_movk = release_blraa ? find_prev_movk48(release_blraa, 4, release_modifier) : NULL;
     if(!set_call_movk || !release_vtable_movk || !release_call_movk)
     {
         return false;
@@ -284,6 +302,26 @@ static void kpf_overlay_kdi_patch(xnu_pf_patchset_t *kdi_text_exec_patchset)
         0xffc003ff,
     };
     xnu_pf_maskmatch(kdi_text_exec_patchset, "KDI_fileset_get", fileset_get_matches, fileset_get_masks, sizeof(fileset_get_matches)/sizeof(uint64_t), false, (void*)kpf_overlay_kdi_fileset_get_callback);
+
+    uint64_t fileset_get_copied_matches[] =
+    {
+        0xd2800011, // mov x17, vtable byte offset
+        0x8b110210, // add x16, x16, x17
+        0xf9400208, // ldr x8, [x16]
+        0xaa1003e0, // mov xN, x16
+        0x90000001, // adrp x1, string
+        0x91000021, // add x1, x1, string offset
+    };
+    uint64_t fileset_get_copied_masks[] =
+    {
+        0xff80001f,
+        0xffffffff,
+        0xffffffff,
+        0xffffffe0,
+        0x9f00001f,
+        0xffc003ff,
+    };
+    xnu_pf_maskmatch(kdi_text_exec_patchset, "KDI_fileset_get_copied", fileset_get_copied_matches, fileset_get_copied_masks, sizeof(fileset_get_copied_matches)/sizeof(uint64_t), false, (void*)kpf_overlay_kdi_fileset_get_callback);
 
     uint64_t fileset_set_matches[] =
     {

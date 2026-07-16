@@ -216,9 +216,11 @@ static bool kpf_shared_region_root_dir_fileset_callback(struct xnu_pf_patch *pat
         panic("kpf_shared_region_root_dir: Found twice");
     }
 
-    // New fileset kernels pass the root shared-region identity as x7 to an
-    // internal helper.  The helper resolves the candidate identity into x0,
-    // reloads the saved x7 into x8, and rejects a mismatch.
+    // The helper returns the shared-region root vnode in x0 and the caller
+    // reloads the current root vnode into x8.  Compilers emit either
+    // `cmp x8, x0; b.ne reject` or `cmp x0, x8; b.eq success`.  Making the
+    // comparison equal preserves both control-flow layouts while bypassing
+    // only the shared-region/root-vnode identity decision.
     opcode_stream[3] = 0xeb00001f; // cmp x0, x0
     found_shared_region_root_dir = true;
 
@@ -270,19 +272,19 @@ static void kpf_shared_region_root_dir_patch(xnu_pf_patchset_t *xnu_text_exec_pa
     };
     xnu_pf_maskmatch(xnu_text_exec_patchset, "shared_region_root_dir_legacy", matches, masks, sizeof(matches)/sizeof(uint64_t), false, (void*)kpf_shared_region_root_dir_callback);
 
-    // arm64e fileset variant:
+    // arm64e fileset variants:
     // bl resolve_candidate_identity
     // cbz x0, ...
-    // ldr x8, [sp, ...]       ; saved root identity (incoming x7)
-    // cmp x8, x0
-    // b.ne reject
+    // ldr x8, [sp, ...]       ; saved current root vnode
+    // cmp x8, x0              ; or: cmp x0, x8
+    // b.ne reject             ; or: b.eq success
     uint64_t fileset_matches[] =
     {
         0x94000000,
         0xb4000000,
         0xf94003e8,
         0xeb00011f,
-        0x54000001,
+        0x54000000,
     };
     uint64_t fileset_masks[] =
     {
@@ -290,9 +292,15 @@ static void kpf_shared_region_root_dir_patch(xnu_pf_patchset_t *xnu_text_exec_pa
         0xff00001f,
         0xffc003ff,
         0xffffffff,
-        0xff00001f,
+        0xff00001e,
     };
     xnu_pf_maskmatch(xnu_text_exec_patchset, "shared_region_root_dir_fileset", fileset_matches, fileset_masks, sizeof(fileset_matches)/sizeof(uint64_t), false, (void*)kpf_shared_region_root_dir_fileset_callback);
+
+    // Same producer/consumer contract with CMP operands exchanged.  A single
+    // mask cannot express the unordered {x0, x8} pair without admitting other
+    // registers, so keep this as a separate, mutually exclusive signature.
+    fileset_matches[3] = 0xeb08001f; // cmp x0, x8
+    xnu_pf_maskmatch(xnu_text_exec_patchset, "shared_region_root_dir_fileset_swapped", fileset_matches, fileset_masks, sizeof(fileset_matches)/sizeof(uint64_t), false, (void*)kpf_shared_region_root_dir_fileset_callback);
 }
 
 static void kpf_bindfs_patches(xnu_pf_patchset_t *xnu_text_exec_patchset)

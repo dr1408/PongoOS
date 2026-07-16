@@ -49,14 +49,14 @@ kpf_ppl_debugger_mapping_callback(struct xnu_pf_patch *patch, uint32_t *opcode_s
         panic("kpf_ppl_debugger_mapping: Found more than one entitlement gate");
     }
 
-    if(opcode_stream[0] != 0xf940e108 ||                 // ldr x8, [x8, #0x1c0]
+    if((opcode_stream[0] & 0xffc003ff) != 0xf9400108 || // ldr x8, [x8, #vtable offset]
        (opcode_stream[1] & 0x9f00001f) != 0x90000001 || // adrp x1, entitlement
        (opcode_stream[2] & 0xffc003ff) != 0x91000021 || // add x1, x1, #...
-       (opcode_stream[3] & 0xffe0001f) != 0xd2800011 || // mov x17, discriminator
-       opcode_stream[4] != 0xd73f0911 ||                // blraa x8, x17
-       opcode_stream[5] != 0x34000260 ||                // cbz w0, associate_cow
-       opcode_stream[6] != 0x528006a0 ||                // mov w0, #KERN_DENIED
-       (opcode_stream[7] & 0xfc000000) != 0x14000000)   // b return
+       (opcode_stream[3] & 0xffe00000) != 0xd2800000 || // mov xN, discriminator
+       (opcode_stream[4] & 0xffffffe0) != 0xd73f0900 || // blraa x8, xN
+       (opcode_stream[4] & 0x1f) != (opcode_stream[3] & 0x1f) ||
+       (opcode_stream[5] & 0xff00001f) != 0x34000000 || // cbz w0, associate_cow
+       opcode_stream[6] != 0x528006a0)                  // mov w0, #KERN_DENIED
     {
         return false;
     }
@@ -73,18 +73,53 @@ kpf_ppl_debugger_mapping_callback(struct xnu_pf_patch *patch, uint32_t *opcode_s
 
     uint32_t *associate_cow = opcode_stream + 5 +
         sxt32(opcode_stream[5] >> 5, 19);
-    if(associate_cow[0] != 0xaa1403e0 || // mov x0, x20 (pmap)
+    if((associate_cow[0] & 0xffe0ffff) != 0xaa0003e0 || // mov x0, xPmap
        associate_cow[1] != 0x92800021 || // mov x1, #-2 (PMAP_CS_ASSOCIATE_COW)
-       associate_cow[2] != 0xaa1503e2 || // mov x2, x21 (region address)
-       associate_cow[3] != 0xaa1303e3 || // mov x3, x19 (region size)
-       associate_cow[4] != 0xd2800004 || // mov x4, #0
-       (associate_cow[5] & 0xfc000000) != 0x94000000 || // bl pmap_cs_associate
-       associate_cow[6] != 0x7100181f)   // cmp w0, #KERN_ABORTED
+       (associate_cow[2] & 0xffe0ffff) != 0xaa0003e2 || // mov x2, xAddress
+       (associate_cow[3] & 0xffe0ffff) != 0xaa0003e3 || // mov x3, xSize
+       associate_cow[4] != 0xd2800004) // mov x4, #0
     {
         return false;
     }
 
-    opcode_stream[5] = 0x14000013; // b associate_cow
+    bool direct_call =
+        (associate_cow[5] & 0xfc000000) == 0x94000000 && // bl pmap_cs_associate
+        associate_cow[6] == 0x7100181f;                  // cmp w0, #KERN_ABORTED
+
+    // Older Darwin 25 builds restore and authenticate the frame, then tail
+    // call pmap_cs_associate instead of returning through this function.
+    uint32_t *autibsp = find_next_insn(associate_cow + 5, 12, 0xd50323ff, 0xffffffff);
+    bool tail_call = autibsp &&
+        autibsp[1] == 0xca1e07d0 &&                       // eor x16, x30, x30, lsl #1
+        (autibsp[2] & 0xfff8001f) == 0xb6f00010 &&       // tbz x16, #62, ...
+        autibsp[3] == 0xd4388e20 &&                       // brk #0xc471
+        (autibsp[4] & 0xfc000000) == 0x14000000;         // b pmap_cs_associate
+    if(!direct_call && !tail_call)
+    {
+        return false;
+    }
+
+    uint32_t pmap_reg = (associate_cow[0] >> 16) & 0x1f;
+    uint32_t address_reg = (associate_cow[2] >> 16) & 0x1f;
+    uint32_t size_reg = (associate_cow[3] >> 16) & 0x1f;
+    uint32_t *entry = find_prev_insn(opcode_stream, 0x40, 0xd503237f, 0xffffffff); // pacibsp
+    uint32_t *pmap_producer = find_prev_insn(opcode_stream, 0x40, 0xaa0003e0 | pmap_reg, 0xffffffff);
+    uint32_t *address_producer = find_prev_insn(opcode_stream, 0x40, 0xaa0103e0 | address_reg, 0xffffffff);
+    uint32_t *size_producer = find_prev_insn(opcode_stream, 0x40, 0xaa0203e0 | size_reg, 0xffffffff);
+    if(!entry ||
+       pmap_reg < 19 || pmap_reg > 28 ||
+       address_reg < 19 || address_reg > 28 ||
+       size_reg < 19 || size_reg > 28 ||
+       pmap_reg == address_reg || pmap_reg == size_reg || address_reg == size_reg ||
+       !pmap_producer || pmap_producer < entry ||
+       !address_producer || address_producer < entry ||
+       !size_producer || size_producer < entry)
+    {
+        return false;
+    }
+
+    int32_t associate_cow_delta = sxt32(opcode_stream[5] >> 5, 19);
+    opcode_stream[5] = 0x14000000 | (associate_cow_delta & 0x03ffffff); // b associate_cow
 
     found_ppl_debugger_mapping = true;
     xnu_pf_disable_patch(patch);
@@ -220,25 +255,23 @@ static void kpf_vm_prot_patches(xnu_pf_patchset_t *xnu_text_exec_patchset)
 
     uint64_t matches[] =
     {
-        0xf940e108, // ldr x8, [x8, #0x1c0]
+        0xf9400108, // ldr x8, [x8, #vtable offset]
         0x90000001, // adrp x1, entitlement
         0x91000021, // add x1, x1, #...
-        0xd2800011, // mov x17, discriminator
-        0xd73f0911, // blraa x8, x17
-        0x34000260, // cbz w0, associate_cow
+        0xd2800000, // mov xN, discriminator
+        0xd73f0900, // blraa x8, xN
+        0x34000000, // cbz w0, associate_cow
         0x528006a0, // mov w0, #KERN_DENIED
-        0x14000000, // b return
     };
     uint64_t masks[] =
     {
-        0xffffffff,
+        0xffc003ff,
         0x9f00001f,
         0xffc003ff,
-        0xffe0001f,
+        0xffe00000,
+        0xffffffe0,
+        0xff00001f,
         0xffffffff,
-        0xffffffff,
-        0xffffffff,
-        0xfc000000,
     };
     xnu_pf_maskmatch(xnu_text_exec_patchset, "ppl_debugger_mapping",
         matches, masks, sizeof(matches) / sizeof(uint64_t), false,

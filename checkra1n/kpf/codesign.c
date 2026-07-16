@@ -71,7 +71,8 @@ kpf_ppl_allow_invalid_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stre
        opcode_stream[7] != 0x3902627f || // strb wzr, [x19, #0x98]
        opcode_stream[8] != 0x52800028 || // mov w8, #1
        opcode_stream[9] != 0x780c1268 || // sturh w8, [x19, #0xc1]
-       opcode_stream[10] != 0x2916fe7f || // stp wzr, wzr, [x19, #0xb4]
+       (opcode_stream[10] != 0x2916fe7f && // stp wzr, wzr, [x19, #0xb4]
+        opcode_stream[10] != 0xf80b427f) || // stur xzr, [x19, #0xb4]
        opcode_stream[11] != 0xd5033bbf || // dmb ish
        opcode_stream[12] != 0xb900b268)   // str w8, [x19, #0xb0]
     {
@@ -124,6 +125,16 @@ kpf_ppl_allow_invalid_patches(xnu_pf_patchset_t *ppl_text_patchset)
     };
 
     xnu_pf_maskmatch(ppl_text_patchset, "ppl_pmap_allow_invalid",
+        matches, masks, sizeof(matches) / sizeof(uint64_t), false,
+        (void *)kpf_ppl_allow_invalid_callback);
+
+    /*
+     * Darwin 25.3 emits an equivalent 64-bit zero store for pmap + 0xb4.
+     * Keep both exact encodings: masking across STP and STUR would admit
+     * unrelated stores and would weaken the producer identity.
+     */
+    matches[10] = 0xf80b427f; // stur xzr, [x19, #0xb4]
+    xnu_pf_maskmatch(ppl_text_patchset, "ppl_pmap_allow_invalid_stur",
         matches, masks, sizeof(matches) / sizeof(uint64_t), false,
         (void *)kpf_ppl_allow_invalid_callback);
 }

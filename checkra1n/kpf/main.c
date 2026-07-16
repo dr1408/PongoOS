@@ -2216,7 +2216,7 @@ void kpf_md0oncores_patch(xnu_pf_patchset_t* patchset)
 {
     uint64_t matches[] =
     {
-        0xd73f0910, // blraa x8, x16
+        0xd73f0900, // blraa x8, xM
         0x52805828, // mov  w8, #0x2c1
         0x72bc0008, // movk w8, #0xe000, lsl #16
         0x6b08001f, // cmp  wN, w8
@@ -2224,7 +2224,7 @@ void kpf_md0oncores_patch(xnu_pf_patchset_t* patchset)
     };
     uint64_t masks[] =
     {
-        0xffffffff,
+        0xffffffe0, // blraa x8, xM (modifier register is build-dependent)
         0xffffffff,
         0xffffffff,
         0xfffffc1f,
