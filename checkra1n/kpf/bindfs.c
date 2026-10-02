@@ -144,6 +144,8 @@ static void kpf_fsctl_dev_by_role_patch(xnu_pf_patchset_t *xnu_text_exec_patchse
 }
 #endif
 
+static bool found_shared_region_root_dir = false;
+
 static bool kpf_shared_region_root_dir_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
 {
     uint32_t *ldr = opcode_stream + 2;
@@ -195,10 +197,10 @@ static bool kpf_shared_region_root_dir_callback(struct xnu_pf_patch *patch, uint
     }
 
     // Now that we're sure this is the right match, enforce uniqueness.
-    static bool found_shared_region_root_dir = false;
     if(found_shared_region_root_dir)
     {
-        panic("kpf_shared_region_root_dir: Found twice");
+        printf("KPF: duplicate shared region root dir candidate (legacy) at 0x%llx\n", (unsigned long long)xnu_ptr_to_va(opcode_stream));
+        return false;
     }
 
     *cmp = 0xeb00001f; // cmp x0, x0
@@ -206,6 +208,98 @@ static bool kpf_shared_region_root_dir_callback(struct xnu_pf_patch *patch, uint
 
     puts("KPF: Found shared region root dir");
     return true;
+}
+
+static bool kpf_shared_region_root_dir_fileset_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    if(found_shared_region_root_dir)
+    {
+        printf("KPF: duplicate shared region root dir candidate (fileset) at 0x%llx\n", (unsigned long long)xnu_ptr_to_va(opcode_stream));
+        return false;
+    }
+
+    // The helper returns the shared-region root vnode in x0 and the caller
+    // reloads the current root vnode into x8.  Compilers emit either
+    // `cmp x8, x0; b.ne reject` or `cmp x0, x8; b.eq success`.  Making the
+    // comparison equal preserves both control-flow layouts while bypassing
+    // only the shared-region/root-vnode identity decision.
+    opcode_stream[3] = 0xeb00001f; // cmp x0, x0
+    found_shared_region_root_dir = true;
+
+    puts("KPF: Found shared region root dir (fileset)");
+    return true;
+}
+
+/*
+ * XR 18.7.10 (22H374) keeps the root-vnode authentication check in a
+ * larger helper rather than using the older inline/fileset sequence above.
+ * The failure block is immediately followed by the diagnostic
+ * "rootvp not authenticated after mounting".  The identity decision is:
+ *
+ *   bl     <rootvp helper>
+ *   ldur   x8, [fp, #-0x68]
+ *   adrp   x9, <rootvp global page>
+ *   add    x9, x9, #0
+ *   ldr    x9, [x9]
+ *   cmp    x9, x8
+ *   b.ne   <authentication failure>
+ *
+ * This is the XR-specific shared/root-vnode check at 0xfffffff0082a3838.
+ * Keep the callback strict: the compare must be followed by a conditional
+ * branch, and the global load must be exactly the x9/x9 form.  Do not match
+ * arbitrary pointer comparisons elsewhere in the kernel.
+ */
+static bool kpf_shared_region_root_dir_xr_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    if(found_shared_region_root_dir)
+    {
+        printf("KPF: duplicate shared region root dir candidate (XR) at 0x%llx\n", (unsigned long long)xnu_ptr_to_va(opcode_stream));
+        return false;
+    }
+
+    if(opcode_stream[1] != 0xf85983a8 || // ldur x8, [fp, #-0x68]
+       (opcode_stream[2] & 0x9f00001f) != 0x90000009 || // adrp x9, ...
+       opcode_stream[3] != 0x91000129 || // add x9, x9, #0
+       opcode_stream[4] != 0xf9400129 || // ldr x9, [x9]
+       opcode_stream[5] != 0xeb08013f || // cmp x9, x8
+       (opcode_stream[6] & 0xff00001f) != 0x54000001) // b.ne
+    {
+        return false;
+    }
+
+    opcode_stream[5] = 0xeb00001f; // cmp x0, x0
+    found_shared_region_root_dir = true;
+    puts("KPF: Found shared region root dir (XR)");
+    return true;
+}
+
+static void kpf_shared_region_root_dir_xr_patch(xnu_pf_patchset_t *xnu_text_exec_patchset)
+{
+    // XR 18.7.10 has a second, older-looking root-vnode sequence elsewhere
+    // in the kernel.  Do not register the generic matchers for this build:
+    // they can also fire and make the single-patch uniqueness check report a
+    // duplicate.  This signature is the check tied to the rootvp diagnostic.
+    uint64_t matches[] =
+    {
+        0x94000069, // bl 0xfffffff0082a39c8 (rootvp helper)
+        0xf85983a8, // ldur x8, [fp, #-0x68]
+        0x90000009, // adrp x9, <rootvp global page>
+        0x91000129, // add x9, x9, #0
+        0xf9400129, // ldr x9, [x9]
+        0xeb08013f, // cmp x9, x8
+        0x54000961, // b.ne 0xfffffff0082a3968 (authentication failure)
+    };
+    uint64_t masks[] =
+    {
+        0xffffffff,
+        0xffffffff,
+        0x9f00001f,
+        0xffffffff,
+        0xffffffff,
+        0xffffffff,
+        0xffffffff,
+    };
+    xnu_pf_maskmatch(xnu_text_exec_patchset, "shared_region_root_dir_xr_18_7_10", matches, masks, sizeof(matches)/sizeof(uint64_t), false, (void*)kpf_shared_region_root_dir_xr_callback);
 }
 
 static void kpf_shared_region_root_dir_patch(xnu_pf_patchset_t *xnu_text_exec_patchset)
@@ -240,6 +334,14 @@ static void kpf_shared_region_root_dir_patch(xnu_pf_patchset_t *xnu_text_exec_pa
     // first two instructions and check the rest in the callback.
     //
     // /x 001040f9086c40f9:1ffcffffffffffff
+    if(gKernelVersion.xnuMajor == 11417 &&
+       gKernelVersion.darwinMajor == 24 &&
+       gKernelVersion.machineConfig == 0x8020)
+    {
+        kpf_shared_region_root_dir_xr_patch(xnu_text_exec_patchset);
+        return;
+    }
+
     uint64_t matches[] =
     {
         0xf9401000, // ldr x0, [x*, 0x20]
@@ -250,7 +352,38 @@ static void kpf_shared_region_root_dir_patch(xnu_pf_patchset_t *xnu_text_exec_pa
         0xfffffc1f,
         0xffffffff,
     };
-    xnu_pf_maskmatch(xnu_text_exec_patchset, "shared_region_root_dir", matches, masks, sizeof(matches)/sizeof(uint64_t), true, (void*)kpf_shared_region_root_dir_callback);
+    xnu_pf_maskmatch(xnu_text_exec_patchset, "shared_region_root_dir_legacy", matches, masks, sizeof(matches)/sizeof(uint64_t), false, (void*)kpf_shared_region_root_dir_callback);
+
+    // arm64e fileset variants:
+    // bl resolve_candidate_identity
+    // cbz x0, ...
+    // ldr x8, [sp, ...]       ; saved current root vnode
+    // cmp x8, x0              ; or: cmp x0, x8
+    // b.ne reject             ; or: b.eq success
+    uint64_t fileset_matches[] =
+    {
+        0x94000000,
+        0xb4000000,
+        0xf94003e8,
+        0xeb00011f,
+        0x54000000,
+    };
+    uint64_t fileset_masks[] =
+    {
+        0xfc000000,
+        0xff00001f,
+        0xffc003ff,
+        0xffffffff,
+        0xff00001e,
+    };
+    xnu_pf_maskmatch(xnu_text_exec_patchset, "shared_region_root_dir_fileset", fileset_matches, fileset_masks, sizeof(fileset_matches)/sizeof(uint64_t), false, (void*)kpf_shared_region_root_dir_fileset_callback);
+
+    // Same producer/consumer contract with CMP operands exchanged.  A single
+    // mask cannot express the unordered {x0, x8} pair without admitting other
+    // registers, so keep this as a separate, mutually exclusive signature.
+    fileset_matches[3] = 0xeb08001f; // cmp x0, x8
+    xnu_pf_maskmatch(xnu_text_exec_patchset, "shared_region_root_dir_fileset_swapped", fileset_matches, fileset_masks, sizeof(fileset_matches)/sizeof(uint64_t), false, (void*)kpf_shared_region_root_dir_fileset_callback);
+
 }
 
 static void kpf_bindfs_patches(xnu_pf_patchset_t *xnu_text_exec_patchset)
@@ -283,6 +416,20 @@ static void kpf_bindfs_init(struct mach_header_64 *hdr, xnu_pf_range_t *cstring)
 
 static void kpf_bindfs_finish(struct mach_header_64 *hdr)
 {
+    /*
+     * Some newer arm64e kernels still contain the rootvp-auth diagnostic
+     * string, but no longer contain the old shared-region identity check.
+     * Do not claim bind-mount support in that case: setting the flag without
+     * removing the check makes the resulting boot fail later, while turning
+     * the missing optional patch into a hard KPF panic hides the rest of the
+     * profile results.
+     */
+    if(do_bind_mounts && !found_shared_region_root_dir)
+    {
+        puts("KPF: shared region root dir patch not present; disabling bind mounts");
+        do_bind_mounts = false;
+    }
+
     // Signal to ramdisk whether we can have union mounts
     if (do_bind_mounts)
         palera1n_flags |= palerain_option_bind_mount;

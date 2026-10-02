@@ -102,23 +102,76 @@ void pongo_copy_xnu(const char *cmd, char *args) {
 */
 
 void pongo_boot_xargs(const char* cmd, char* args) {
+    struct boot_args* cBootArgs = (struct boot_args*)((uint64_t)gBootArgs - 0x800000000 + kCacheableView);
+    char *command_line;
+    size_t command_line_size;
+    switch(cBootArgs->Revision)
+    {
+        case 1:
+            command_line = cBootArgs->iOS12.CommandLine;
+            command_line_size = BOOT_LINE_LENGTH_iOS12;
+            break;
+        case 2:
+            command_line = cBootArgs->iOS13.CommandLine;
+            command_line_size = BOOT_LINE_LENGTH_iOS13;
+            break;
+        case 3:
+            command_line = cBootArgs->iOS18.CommandLine;
+            command_line_size = BOOT_LINE_LENGTH_iOS18;
+            break;
+        default:
+            iprintf("Unsupported boot_args revision: %u\n", cBootArgs->Revision);
+            return;
+    }
+
     if (args[0] == 0) {
-        // get
-        iprintf("Xnu boot arg cmdline: [%s]\n", (char*)((int64_t)gBootArgs->iOS13.CommandLine - 0x800000000 + kCacheableView) );
+        iprintf("Xnu boot arg cmdline: [%s]\n", command_line);
     } else {
-        strcpy((char*)((int64_t)gBootArgs->iOS13.CommandLine - 0x800000000 + kCacheableView ), args);
-        iprintf("Set xnu boot arg cmdline to: [%s]\n", (char*)((int64_t)gBootArgs->iOS13.CommandLine - 0x800000000 + kCacheableView ));
-        if (strlen(args) > BOOT_LINE_LENGTH_iOS12) {
-            iprintf("This exceeds the size limit for iOS 12 and earlier, you better be on 13 or later.\n");
+        size_t len = strlen(args);
+        if(len >= command_line_size)
+        {
+            iprintf("Boot args exceed revision %u limit of %zu bytes\n",
+                    cBootArgs->Revision, command_line_size - 1);
+            return;
         }
+        memcpy(command_line, args, len + 1);
+        iprintf("Set xnu boot arg cmdline to: [%s]\n", command_line);
     }
 }
 
 _Static_assert(__builtin_offsetof(struct boot_args, deviceTreeLength) + 4 == __builtin_offsetof(struct boot_args, iOS13.CommandLine), "boot-args CommandLine offset");
+_Static_assert(__builtin_offsetof(struct boot_args, iOS12.bootFlags) - __builtin_offsetof(struct boot_args, iOS12.CommandLine) == BOOT_LINE_LENGTH_iOS12 + 4, "revision 1 boot-args layout");
+_Static_assert(__builtin_offsetof(struct boot_args, iOS13.bootFlags) - __builtin_offsetof(struct boot_args, iOS13.CommandLine) == BOOT_LINE_LENGTH_iOS13 + 4, "revision 2 boot-args layout");
+_Static_assert(__builtin_offsetof(struct boot_args, iOS18.bootFlags) == 0x470, "revision 3 boot flags offset");
+_Static_assert(__builtin_offsetof(struct boot_args, iOS18.memSizeActual) == 0x478, "revision 3 actual memory offset");
 
 void log_bootargs(const char *cmd, char *args)
 {
     struct boot_args* cBootArgs = (struct boot_args*)((uint64_t)gBootArgs - 0x800000000 + kCacheableView);
+    const char *command_line;
+    uint64_t boot_flags;
+    uint64_t mem_size_actual;
+    switch(cBootArgs->Revision)
+    {
+        case 1:
+            command_line = cBootArgs->iOS12.CommandLine;
+            boot_flags = cBootArgs->iOS12.bootFlags;
+            mem_size_actual = cBootArgs->iOS12.memSizeActual;
+            break;
+        case 2:
+            command_line = cBootArgs->iOS13.CommandLine;
+            boot_flags = cBootArgs->iOS13.bootFlags;
+            mem_size_actual = cBootArgs->iOS13.memSizeActual;
+            break;
+        case 3:
+            command_line = cBootArgs->iOS18.CommandLine;
+            boot_flags = cBootArgs->iOS18.bootFlags;
+            mem_size_actual = cBootArgs->iOS18.memSizeActual;
+            break;
+        default:
+            iprintf("Unsupported boot_args revision: %u\n", cBootArgs->Revision);
+            return;
+    }
     iprintf("gBootArgs:\n"
             "\tRevision: 0x%x\n"
             "\tVersion: 0x%x\n"
@@ -129,11 +182,9 @@ void log_bootargs(const char *cmd, char *args)
             "\tmachineType: 0x%x\n"
             "\tdeviceTreeP: 0x%llx\n"
             "\tdeviceTreeLength: 0x%x\n"
-            "\tCommandLine: 0x%s\n"
-            "\tbootFlags (<=iOS12): 0x%llx\n"
-            "\tmemSizeActual (<=iOS12): 0x%llx\n"
-            "\tbootFlags (>=iOS13): 0x%llx\n"
-            "\tmemSizeActual (>=iOS13): 0x%llx\n",
+            "\tCommandLine: %s\n"
+            "\tbootFlags: 0x%llx\n"
+            "\tmemSizeActual: 0x%llx\n",
             cBootArgs->Revision,
             cBootArgs->Version,
             cBootArgs->virtBase,
@@ -143,11 +194,9 @@ void log_bootargs(const char *cmd, char *args)
             cBootArgs->machineType,
             (uint64_t)cBootArgs->deviceTreeP,
             cBootArgs->deviceTreeLength,
-            cBootArgs->iOS13.CommandLine,
-            cBootArgs->iOS12.bootFlags,
-            cBootArgs->iOS12.memSizeActual,
-            cBootArgs->iOS13.bootFlags,
-            cBootArgs->iOS13.memSizeActual);
+            command_line,
+            boot_flags,
+            mem_size_actual);
 }
 
 void flip_video_display(const char *cmd, char *args) {
@@ -163,8 +212,171 @@ extern void* ramdisk_buf;
 extern uint32_t ramdisk_size;
 
 struct mach_header_64* xnu_header_cached;
+static struct mach_header_64* xnu_fileset_header_cached;
+static uint8_t* xnu_fileset_base_cached;
+static uint64_t xnu_fileset_phys_base_cached;
+
+static void* xnu_va_to_ptr_raw(uint64_t va)
+{
+    return (void*)(va - gBootArgs->virtBase + gBootArgs->physBase - 0x800000000ULL + kCacheableView);
+}
+
+static struct mach_header_64* xnu_fileset_header(void)
+{
+    if(xnu_fileset_header_cached) return xnu_fileset_header_cached;
+
+    struct mach_header_64 *header = NULL;
+#ifndef KPF_TEST
+    size_t map_size = 0;
+    struct memmap *map = dt_get_prop("/chosen/memory-map", "Kernel-mach_header", &map_size);
+    if(map && map_size == sizeof(*map) && map->size >= sizeof(*header))
+    {
+        xnu_fileset_phys_base_cached = map->addr;
+        xnu_fileset_base_cached = (uint8_t*)(map->addr - 0x800000000ULL + kCacheableView);
+        header = (struct mach_header_64*)xnu_fileset_base_cached;
+    }
+    else
+#endif
+    {
+        header = xnu_va_to_ptr_raw(gBootArgs->virtBase);
+    }
+    if(header->magic == MH_MAGIC_64 && header->filetype == MH_FILESET)
+    {
+        xnu_fileset_header_cached = header;
+        if(!xnu_fileset_base_cached)
+        {
+            xnu_fileset_base_cached = (uint8_t*)header;
+            xnu_fileset_phys_base_cached = gBootArgs->physBase;
+        }
+    }
+    return xnu_fileset_header_cached;
+}
+
+static uint64_t xnu_fileset_slide(void)
+{
+    struct mach_header_64 *header = xnu_fileset_header();
+    if(!header) return 0;
+
+    struct load_command *lc = (struct load_command*)(header + 1);
+    for(uint32_t i = 0; i < header->ncmds; ++i)
+    {
+        if(lc->cmd == LC_SEGMENT_64)
+        {
+            struct segment_command_64 *seg = (struct segment_command_64*)lc;
+            if(!strcmp(seg->segname, "__TEXT"))
+            {
+                return gBootArgs->virtBase - seg->vmaddr;
+            }
+        }
+        lc = (struct load_command*)((uintptr_t)lc + lc->cmdsize);
+    }
+    panic("fileset has no __TEXT segment");
+}
+
+static void* xnu_fileset_macho_va_to_ptr(struct mach_header_64 *header, uint64_t va)
+{
+    struct load_command *lc = (struct load_command*)(header + 1);
+    for(uint32_t i = 0; i < header->ncmds; ++i)
+    {
+        if(lc->cmd == LC_SEGMENT_64)
+        {
+            struct segment_command_64 *seg = (struct segment_command_64*)lc;
+            if(va >= seg->vmaddr && va - seg->vmaddr < seg->filesize)
+            {
+                return xnu_fileset_base_cached + seg->fileoff + (va - seg->vmaddr);
+            }
+        }
+        lc = (struct load_command*)((uintptr_t)lc + lc->cmdsize);
+    }
+    return NULL;
+}
+
+static bool xnu_fileset_macho_ptr_to_va(struct mach_header_64 *header, void *ptr, uint64_t *va)
+{
+    if((uint8_t*)ptr < xnu_fileset_base_cached) return false;
+    uint64_t fileoff = (uint8_t*)ptr - xnu_fileset_base_cached;
+
+    struct load_command *lc = (struct load_command*)(header + 1);
+    for(uint32_t i = 0; i < header->ncmds; ++i)
+    {
+        if(lc->cmd == LC_SEGMENT_64)
+        {
+            struct segment_command_64 *seg = (struct segment_command_64*)lc;
+            if(fileoff >= seg->fileoff && fileoff - seg->fileoff < seg->filesize)
+            {
+                *va = seg->vmaddr + xnu_fileset_slide() + (fileoff - seg->fileoff);
+                return true;
+            }
+        }
+        lc = (struct load_command*)((uintptr_t)lc + lc->cmdsize);
+    }
+    return false;
+}
+
+static void* xnu_fileset_va_to_ptr(uint64_t va)
+{
+    struct mach_header_64 *fileset = xnu_fileset_header();
+    if(!fileset) return NULL;
+
+    uint64_t canonical_va = va - xnu_fileset_slide();
+    void *result = xnu_fileset_macho_va_to_ptr(fileset, canonical_va);
+    if(result) return result;
+
+    struct load_command *lc = (struct load_command*)(fileset + 1);
+    for(uint32_t i = 0; i < fileset->ncmds; ++i)
+    {
+        if(lc->cmd == LC_FILESET_ENTRY)
+        {
+            struct fileset_entry_command *entry = (struct fileset_entry_command*)lc;
+            struct mach_header_64 *entry_header =
+                (struct mach_header_64*)(xnu_fileset_base_cached + entry->fileoff);
+            result = xnu_fileset_macho_va_to_ptr(entry_header, canonical_va);
+            if(result) return result;
+        }
+        lc = (struct load_command*)((uintptr_t)lc + lc->cmdsize);
+    }
+    return NULL;
+}
+
+static struct mach_header_64* xnu_fileset_entry(const char *bundle_id)
+{
+    struct mach_header_64 *header = xnu_fileset_header();
+    if(!header) return NULL;
+
+    struct load_command *lc = (struct load_command*)(header + 1);
+    for(uint32_t i = 0; i < header->ncmds; ++i)
+    {
+        if(lc->cmd == LC_FILESET_ENTRY)
+        {
+            struct fileset_entry_command *entry = (struct fileset_entry_command*)lc;
+            if(entry->entry_id.offset < entry->cmdsize)
+            {
+                const char *entry_id = (const char*)entry + entry->entry_id.offset;
+                size_t entry_id_size = entry->cmdsize - entry->entry_id.offset;
+                if(memchr(entry_id, '\0', entry_id_size) && !strcmp(entry_id, bundle_id))
+                {
+                    struct mach_header_64 *result = (struct mach_header_64*)(xnu_fileset_base_cached + entry->fileoff);
+                    if(result->magic != MH_MAGIC_64)
+                    {
+                        panic("bad fileset entry %s", bundle_id);
+                    }
+                    return result;
+                }
+            }
+        }
+        lc = (struct load_command*)((uintptr_t)lc + lc->cmdsize);
+    }
+    return NULL;
+}
+
 struct mach_header_64* xnu_header(void) {
     if (xnu_header_cached) return xnu_header_cached;
+    if(xnu_fileset_header())
+    {
+        xnu_header_cached = xnu_fileset_entry("com.apple.kernel");
+        if(!xnu_header_cached) panic("fileset has no com.apple.kernel");
+        return xnu_header_cached;
+    }
     uint64_t entryp = (uint64_t) gEntryPoint;
     entryp -= 0x800000000 - kCacheableView;
     entryp &= ~0xfff;
@@ -247,9 +459,34 @@ uint64_t xnu_slide_value(struct mach_header_64* header) {
     return slide;
 }
 void* xnu_va_to_ptr(uint64_t va) {
-    return (void*)(va - gBootArgs->virtBase + gBootArgs->physBase - 0x800000000ULL + kCacheableView);
+    if(xnu_fileset_header())
+    {
+        void *ptr = xnu_fileset_va_to_ptr(va);
+        if(!ptr) panic("fileset VA is not file-backed: %llx", va);
+        return ptr;
+    }
+    return xnu_va_to_ptr_raw(va);
 }
 uint64_t xnu_ptr_to_va(void* ptr) {
+    struct mach_header_64 *fileset = xnu_fileset_header();
+    if(fileset)
+    {
+        uint64_t va = 0;
+        if(xnu_fileset_macho_ptr_to_va(fileset, ptr, &va)) return va;
+
+        struct load_command *lc = (struct load_command*)(fileset + 1);
+        for(uint32_t i = 0; i < fileset->ncmds; ++i)
+        {
+            if(lc->cmd == LC_FILESET_ENTRY)
+            {
+                struct fileset_entry_command *entry = (struct fileset_entry_command*)lc;
+                struct mach_header_64 *entry_header =
+                    (struct mach_header_64*)(xnu_fileset_base_cached + entry->fileoff);
+                if(xnu_fileset_macho_ptr_to_va(entry_header, ptr, &va)) return va;
+            }
+            lc = (struct load_command*)((uintptr_t)lc + lc->cmdsize);
+        }
+    }
     return ((uint64_t)ptr) - kCacheableView + 0x800000000ULL - gBootArgs->physBase + gBootArgs->virtBase;
 }
 
@@ -290,6 +527,34 @@ uint64_t kext_rebase_va(uint64_t va) {
     return va + xnu_slide_value(xnu_header());
 }
 
+uint64_t xnu_fileset_decode_rebase(uint64_t raw)
+{
+    if(!xnu_fileset_header()) panic("fileset rebase used on legacy kernelcache");
+    if((raw >> 62) & 1) panic("fileset bind pointer is not a rebase");
+
+    uint64_t target;
+    if(raw >> 63)
+    {
+        target = raw & 0xffffffffULL;
+    }
+    else
+    {
+        target = raw & 0x7ffffffffffULL;
+    }
+    return gBootArgs->virtBase + target;
+}
+
+uint64_t xnu_fileset_retarget_auth_rebase(uint64_t raw, uint64_t target_va)
+{
+    if(!xnu_fileset_header()) panic("fileset auth rebase used on legacy kernelcache");
+    if(!(raw >> 63) || ((raw >> 62) & 1)) panic("pointer is not an auth rebase");
+    if(target_va < gBootArgs->virtBase) panic("fileset auth target below base");
+
+    uint64_t target = target_va - gBootArgs->virtBase;
+    if(target > 0xffffffffULL) panic("fileset auth target does not fit");
+    return (raw & 0xffffffff00000000ULL) | target;
+}
+
 xnu_pf_range_t* xnu_pf_range_from_va(uint64_t va, uint64_t size) {
     xnu_pf_range_t* range = malloc(sizeof(xnu_pf_range_t));
     range->va = va;
@@ -298,10 +563,23 @@ xnu_pf_range_t* xnu_pf_range_from_va(uint64_t va, uint64_t size) {
     range->device_base = ((uint8_t*)(va - gBootArgs->virtBase + gBootArgs->physBase));
     return range;
 }
+
+static xnu_pf_range_t* xnu_pf_fileset_range(uint64_t va, uint64_t size, uint64_t fileoff)
+{
+    xnu_pf_range_t* range = malloc(sizeof(xnu_pf_range_t));
+    range->va = va;
+    range->size = size;
+    range->cacheable_base = xnu_fileset_base_cached + fileoff;
+    range->device_base = (uint8_t*)(xnu_fileset_phys_base_cached + fileoff);
+    return range;
+}
+
 xnu_pf_range_t* xnu_pf_segment(struct mach_header_64* header, const char* segment_name) {
     struct segment_command_64* seg = macho_get_segment(header, segment_name);
     if (!seg) return NULL;
 
+    if(xnu_fileset_header())
+        return xnu_pf_fileset_range(seg->vmaddr + xnu_fileset_slide(), seg->filesize, seg->fileoff);
     if (header != xnu_header())
         return xnu_pf_range_from_va(xnu_slide_value(xnu_header()) + (0xffff000000000000 | seg->vmaddr), seg->filesize);
     return xnu_pf_range_from_va(xnu_slide_hdr_va(header, seg->vmaddr), seg->filesize);
@@ -313,12 +591,38 @@ xnu_pf_range_t* xnu_pf_section(struct mach_header_64* header, const char* segmen
     struct section_64* sec = macho_get_section(seg, section_name);
     if (!sec) return NULL;
 
+    if(xnu_fileset_header())
+        return xnu_pf_fileset_range(sec->addr + xnu_fileset_slide(), sec->size, sec->offset);
     if (header != xnu_header())
         return xnu_pf_range_from_va(xnu_slide_value(xnu_header()) + (0xffff000000000000 | sec->addr), sec->size);
 
     return xnu_pf_range_from_va(xnu_slide_hdr_va(header, sec->addr), sec->size);
 }
 struct mach_header_64* xnu_pf_get_first_kext(struct mach_header_64* kheader) {
+    struct mach_header_64 *fileset = xnu_fileset_header();
+    if(fileset)
+    {
+        struct load_command *lc = (struct load_command*)(fileset + 1);
+        for(uint32_t i = 0; i < fileset->ncmds; ++i)
+        {
+            if(lc->cmd == LC_FILESET_ENTRY)
+            {
+                struct fileset_entry_command *entry = (struct fileset_entry_command*)lc;
+                if(entry->entry_id.offset < entry->cmdsize)
+                {
+                    const char *entry_id = (const char*)entry + entry->entry_id.offset;
+                    size_t entry_id_size = entry->cmdsize - entry->entry_id.offset;
+                    if(memchr(entry_id, '\0', entry_id_size) && strcmp(entry_id, "com.apple.kernel"))
+                    {
+                        return (struct mach_header_64*)(xnu_fileset_base_cached + entry->fileoff);
+                    }
+                }
+            }
+            lc = (struct load_command*)((uintptr_t)lc + lc->cmdsize);
+        }
+        return NULL;
+    }
+
     xnu_pf_range_t* kmod_start_range = xnu_pf_section(kheader, "__PRELINK_INFO", "__kmod_start");
     if (!kmod_start_range) {
         kmod_start_range = xnu_pf_section(kheader, "__PRELINK_TEXT", "__text");
@@ -335,6 +639,8 @@ struct mach_header_64* xnu_pf_get_first_kext(struct mach_header_64* kheader) {
     return (struct mach_header_64*)xnu_va_to_ptr(kextb);
 }
 struct mach_header_64* xnu_pf_get_kext_header(struct mach_header_64* kheader, const char* kext_bundle_id) {
+    if(xnu_fileset_header()) return xnu_fileset_entry(kext_bundle_id);
+
     xnu_pf_range_t* kmod_info_range = xnu_pf_section(kheader, "__PRELINK_INFO", "__kmod_info");
     if (!kmod_info_range) {
         char kname[256];
@@ -410,6 +716,49 @@ struct mach_header_64* xnu_pf_get_kext_header(struct mach_header_64* kheader, co
 }
 void xnu_pf_apply_each_kext(struct mach_header_64* kheader, xnu_pf_patchset_t* patchset)
 {
+    struct mach_header_64 *fileset = xnu_fileset_header();
+    if(fileset)
+    {
+        bool is_required = patchset->is_required;
+        patchset->is_required = false;
+        struct load_command *lc = (struct load_command*)(fileset + 1);
+        for(uint32_t i = 0; i < fileset->ncmds; ++i)
+        {
+            if(lc->cmd == LC_FILESET_ENTRY)
+            {
+                struct fileset_entry_command *entry = (struct fileset_entry_command*)lc;
+                if(entry->entry_id.offset < entry->cmdsize)
+                {
+                    const char *entry_id = (const char*)entry + entry->entry_id.offset;
+                    size_t entry_id_size = entry->cmdsize - entry->entry_id.offset;
+                    if(memchr(entry_id, '\0', entry_id_size) && strcmp(entry_id, "com.apple.kernel"))
+                    {
+                        struct mach_header_64 *kexth = (struct mach_header_64*)(xnu_fileset_base_cached + entry->fileoff);
+                        xnu_pf_range_t *apply_range = xnu_pf_section(kexth, "__TEXT_EXEC", "__text");
+                        if(apply_range)
+                        {
+                            xnu_pf_apply(apply_range, patchset);
+                            free(apply_range);
+                        }
+                    }
+                }
+            }
+            lc = (struct load_command*)((uintptr_t)lc + lc->cmdsize);
+        }
+        patchset->is_required = is_required;
+        if(is_required)
+        {
+            for(xnu_pf_patch_t *patch = patchset->patch_head; patch; patch = patch->next_patch)
+            {
+                if(patch->is_required && !patch->has_fired)
+                {
+                    panic("Missing patch: %s", patch->name);
+                }
+            }
+        }
+        return;
+    }
+
     xnu_pf_range_t* kmod_start_range = xnu_pf_section(kheader, "__PRELINK_INFO", "__kmod_start");
     if (!kmod_start_range) {
         xnu_pf_range_t* kext_text_exec_range = xnu_pf_section(kheader, "__PLK_TEXT_EXEC", "__text");
@@ -564,8 +913,15 @@ struct xnu_pf_ptr_to_datamatch {
 
 void xnu_pf_ptr_to_data_match(struct xnu_pf_ptr_to_datamatch* patch, uint8_t access_type, void* preread, void* cacheable_stream) {
     uint64_t pointer = *(uint64_t*)preread;
-    pointer |= 0xffff000000000000;
-    pointer += patch->slide;
+    if(xnu_fileset_header())
+    {
+        pointer = xnu_fileset_decode_rebase(pointer);
+    }
+    else
+    {
+        pointer |= 0xffff000000000000;
+        pointer += patch->slide;
+    }
 
     if (pointer >= patch->range->va && pointer < (patch->range->va + patch->range->size)) {
         if (memcmp(patch->data, (void*)(pointer - patch->range->va + patch->range->cacheable_base), patch->datasz) == 0) {
@@ -596,6 +952,7 @@ xnu_pf_patch_t* xnu_pf_maskmatch(xnu_pf_patchset_t* patchset, char * name, uint6
     mm->patch.pf_emit = (void*)xnu_pf_maskmatch_emit;
     mm->patch.pf_match = (void*)xnu_pf_maskmatch_match;
     mm->patch.is_required = required;
+    mm->patch.name = "ptr_to_data";
     mm->patch.name = name;
     mm->pair_count = entryc;
 
@@ -726,8 +1083,16 @@ uint32_t* xnu_pf_ptr_to_data_emit(struct xnu_pf_ptr_to_datamatch* patch, struct 
 
     insn_stream = xnu_pf_imm64_load_emit(insn_stream, 0, patch->range->va);
     insn_stream = xnu_pf_imm64_load_emit(insn_stream, 1, patch->range->va + patch->range->size);
-    insn_stream = xnu_pf_imm64_load_emit(insn_stream, 2, 0xffff000000000000);
-    insn_stream = xnu_pf_imm64_load_emit(insn_stream, 3, patch->slide);
+    if(xnu_fileset_header())
+    {
+        insn_stream = xnu_pf_imm64_load_emit(insn_stream, 2, 0);
+        insn_stream = xnu_pf_imm64_load_emit(insn_stream, 3, gBootArgs->virtBase);
+    }
+    else
+    {
+        insn_stream = xnu_pf_imm64_load_emit(insn_stream, 2, 0xffff000000000000);
+        insn_stream = xnu_pf_imm64_load_emit(insn_stream, 3, patch->slide);
+    }
     insn_stream = xnu_pf_align3_emit(insn_stream);
     insn_stream = xnu_pf_emit_insns(insn_stream, &pf_jit_ptr_comparison_start, &pf_jit_ptr_comparison_end);
 

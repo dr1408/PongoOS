@@ -98,19 +98,19 @@ typedef struct boot_args {
 			uint32_t		__pad;
 			uint64_t		bootFlags;		/* Additional flags specified by the bootloader */
 			uint64_t		memSizeActual;		/* Actual size of memory */
-		} iOS12;
+		} __attribute__((packed)) iOS12;
 		struct {
 			char			CommandLine[BOOT_LINE_LENGTH_iOS13];	/* Passed in command line */
 			uint32_t		__pad;
 			uint64_t		bootFlags;		/* Additional flags specified by the bootloader */
 			uint64_t		memSizeActual;		/* Actual size of memory */
-		} iOS13;
+		} __attribute__((packed)) iOS13;
 		struct {
 			char			CommandLine[BOOT_LINE_LENGTH_iOS18];	/* Passed in command line */
 			uint32_t		__pad;
 			uint64_t		bootFlags;		/* Additional flags specified by the bootloader */
 			uint64_t		memSizeActual;		/* Actual size of memory */
-		} iOS18;
+		} __attribute__((packed)) iOS18;
 	};
 } __attribute__((packed)) boot_args;
 
@@ -318,6 +318,8 @@ extern void* xnu_va_to_ptr(uint64_t va);
 extern uint64_t xnu_ptr_to_va(void* ptr);
 extern uint64_t xnu_rebase_va(uint64_t va);
 extern uint64_t kext_rebase_va(uint64_t va);
+extern uint64_t xnu_fileset_decode_rebase(uint64_t raw);
+extern uint64_t xnu_fileset_retarget_auth_rebase(uint64_t raw, uint64_t target_va);
 extern struct mach_header_64* xnu_pf_get_kext_header(struct mach_header_64* kheader, const char* kext_bundle_id);
 extern void xnu_pf_apply_each_kext(struct mach_header_64* kheader, xnu_pf_patchset_t* patchset);
 
