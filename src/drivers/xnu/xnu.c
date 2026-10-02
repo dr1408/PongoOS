@@ -215,10 +215,17 @@ struct mach_header_64* xnu_header_cached;
 static struct mach_header_64* xnu_fileset_header_cached;
 static uint8_t* xnu_fileset_base_cached;
 static uint64_t xnu_fileset_phys_base_cached;
+static struct mach_header_64* xnu_fileset_header(void);
 
 static void* xnu_va_to_ptr_raw(uint64_t va)
 {
     return (void*)(va - gBootArgs->virtBase + gBootArgs->physBase - 0x800000000ULL + kCacheableView);
+}
+
+static uint64_t xnu_fileset_live_base_va(void)
+{
+    if(!xnu_fileset_header()) panic("fileset live base used on legacy kernelcache");
+    return gBootArgs->virtBase + (xnu_fileset_phys_base_cached - gBootArgs->physBase);
 }
 
 static struct mach_header_64* xnu_fileset_header(void)
@@ -265,7 +272,7 @@ static uint64_t xnu_fileset_slide(void)
             struct segment_command_64 *seg = (struct segment_command_64*)lc;
             if(!strcmp(seg->segname, "__TEXT"))
             {
-                return gBootArgs->virtBase - seg->vmaddr;
+                return xnu_fileset_live_base_va() - seg->vmaddr;
             }
         }
         lc = (struct load_command*)((uintptr_t)lc + lc->cmdsize);
@@ -541,16 +548,17 @@ uint64_t xnu_fileset_decode_rebase(uint64_t raw)
     {
         target = raw & 0x7ffffffffffULL;
     }
-    return gBootArgs->virtBase + target;
+    return xnu_fileset_live_base_va() + target;
 }
 
 uint64_t xnu_fileset_retarget_auth_rebase(uint64_t raw, uint64_t target_va)
 {
     if(!xnu_fileset_header()) panic("fileset auth rebase used on legacy kernelcache");
     if(!(raw >> 63) || ((raw >> 62) & 1)) panic("pointer is not an auth rebase");
-    if(target_va < gBootArgs->virtBase) panic("fileset auth target below base");
+    uint64_t base = xnu_fileset_live_base_va();
+    if(target_va < base) panic("fileset auth target below base");
 
-    uint64_t target = target_va - gBootArgs->virtBase;
+    uint64_t target = target_va - base;
     if(target > 0xffffffffULL) panic("fileset auth target does not fit");
     return (raw & 0xffffffff00000000ULL) | target;
 }
@@ -1086,7 +1094,7 @@ uint32_t* xnu_pf_ptr_to_data_emit(struct xnu_pf_ptr_to_datamatch* patch, struct 
     if(xnu_fileset_header())
     {
         insn_stream = xnu_pf_imm64_load_emit(insn_stream, 2, 0);
-        insn_stream = xnu_pf_imm64_load_emit(insn_stream, 3, gBootArgs->virtBase);
+        insn_stream = xnu_pf_imm64_load_emit(insn_stream, 3, xnu_fileset_live_base_va());
     }
     else
     {

@@ -51,6 +51,12 @@
 
 extern uint64_t palera1n_flags;
 
+/* The standalone KPF validator does not link PongoOS' mm.c. */
+uint64_t vatophys_static(void *kva)
+{
+    return (uint64_t)kva - OVERRIDE_CACHEABLE_VIEW + 0x800000000ULL;
+}
+
 #define SWAP32(x) (((x & 0xff000000) >> 24) | ((x & 0xff0000) >> 8) | ((x & 0xff00) << 8) | ((x & 0xff) << 24))
 
 #define MACH_MAGIC   MH_MAGIC_64
