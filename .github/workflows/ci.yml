@@ -1,11 +1,7 @@
 name: Build KPF & Pongo
 
 on:
-  # Trigger on all pushes and pull requests
-  push:
-  pull_request:
-
-  # Allows you to run this workflow manually from the Actions tab
+  # Manual trigger only
   workflow_dispatch:
 
 jobs:
@@ -44,19 +40,11 @@ jobs:
           mv build/Pongo.bin upload/Pongo.bin.development
           mv build/checkra1n-kpf-pongo upload/checkra1n-kpf-pongo.development
 
-      - name: Get branch name
-        id: branch-name
-        uses: tj-actions/branch-names@v7
-
-      - name: Upload artifact
-        uses: wangyucode/sftp-upload-action@v1.4.8
+      - name: Upload artifacts (attached to run)
+        uses: actions/upload-artifact@v4
         with:
-          host: ${{ secrets.NICKCHAN_FTP_HOST }}
-          port: ${{ secrets.NICKCHAN_FTP_PORT }}
-          username: palera1n
-          password: ${{ secrets.NICKCHAN_FTP_PASS }}
-          forceUpload: true
-          dryRun: false
-          localDir: 'upload'
-          remoteDir: "/palera1n/artifacts/kpf/${{ steps.branch-name.outputs.ref_branch || github.ref }}"
+          name: kpf-pongo-${{ github.ref_name }}
+          path: upload
+          if-no-files-found: error
+          retention-days: 30
 

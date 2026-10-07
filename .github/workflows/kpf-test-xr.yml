@@ -1,0 +1,120 @@
+name: KPF Test (iPhone XR 18.7.10)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pongoos_branch:
+        description: 'PongoOS branch to build kpf-test from (both must contain FILESET support)'
+        required: true
+        default: 't8030'
+        type: choice
+        options:
+          - t8030
+          - test
+      device:
+        description: 'Device identifier'
+        required: false
+        default: 'iPhone11,8'
+      build:
+        description: 'iOS build id'
+        required: false
+        default: '22H374'
+      version:
+        description: 'iOS version'
+        required: false
+        default: '18.7.10'
+
+jobs:
+  kpf-test-xr:
+    name: Build and run kpf-test against XR 18.7.10 kernel (PongoOS ${{ inputs.pongoos_branch }})
+    runs-on: macos-latest
+    env:
+      DEVICE: ${{ github.event.inputs.device || 'iPhone11,8' }}
+      BUILD:  ${{ github.event.inputs.build  || '22H374' }}
+      IOS:    ${{ github.event.inputs.version || '18.7.10' }}
+
+    steps:
+      - name: Checkout selected PongoOS branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pongoos_branch }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install blacktop/ipsw
+        run: |
+          brew tap blacktop/tap
+          brew trust blacktop/tap
+          brew install blacktop/tap/ipsw
+          ipsw version
+
+      - name: Compute sanitized cache key (no commas)
+        id: cache-key
+        run: |
+          echo "device_key=${DEVICE//,/_}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache decompressed kernelcache
+        id: cache-kc
+        uses: actions/cache@v4
+        with:
+          path: kc/kernelcache.decompressed
+          key: kc-${{ steps.cache-key.outputs.device_key }}-${{ env.BUILD }}-v2
+
+      - name: Download kernelcache only (partial IPSW)
+        if: steps.cache-kc.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p kc
+          cd kc
+          ipsw download ipsw \
+            --device "${DEVICE}" \
+            --build "${BUILD}" \
+            --kernel \
+            --confirm
+          echo "=== files produced by ipsw download ==="
+          find . -type f | sort
+          echo "========================================"
+
+      - name: Materialize decompressed kernelcache
+        if: steps.cache-kc.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          cd kc
+          # ipsw's download step produces either an im4p-wrapped kernelcache
+          # (needs `ipsw kernel dec`) or a raw Mach-O (newer ipsw releases
+          # already decompress). Detect by Mach-O magic and branch.
+          kc="$(find . -type f -name 'kernelcache.release.*.im4p' | head -1)"
+          [ -z "$kc" ] && kc="$(find . -type f -name 'kernelcache.release.*' ! -name '*.decompressed' | head -1)"
+          if [ -z "$kc" ]; then
+            echo "::error::no kernelcache in downloaded tree"
+            find . -type f
+            exit 1
+          fi
+          echo "input kernelcache: $kc"
+          file "$kc"
+          magic="$(head -c 4 "$kc" | xxd -p)"
+          echo "magic: $magic"
+          case "$magic" in
+            cffaedfe|cefaedfe|feedfacf|feedface|cafebabe|bebafeca)
+              echo "already a Mach-O; copying as-is"
+              cp "$kc" kernelcache.decompressed
+              ;;
+            *)
+              echo "appears to be IM4P-wrapped; decompressing"
+              ipsw kernel dec "$kc" -o kernelcache.decompressed
+              ;;
+          esac
+          file kernelcache.decompressed
+          head -c 4 kernelcache.decompressed | xxd -p
+          shasum -a 256 kernelcache.decompressed
+
+      - name: Build kpf-test (macOS target)
+        run: |
+          cd checkra1n/kpf-test
+          make kpf-test.macos
+          file kpf-test.macos
+
+      - name: Run kpf-test against XR 18.7.10 kernel
+        run: |
+          cd checkra1n/kpf-test
+          ./kpf-test.macos -v ../../kc/kernelcache.decompressed
