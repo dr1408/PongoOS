@@ -34,7 +34,7 @@
 
 static bool nvram_patch_found = false;
 
-static bool kpf_nvram_table_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+static bool kpf_nvram_table_common_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream, uint32_t *ldr)
 {
     if(nvram_patch_found)
     {
@@ -54,7 +54,6 @@ static bool kpf_nvram_table_callback(struct xnu_pf_patch *patch, uint32_t *opcod
         return false;
     }
 
-    uint32_t *ldr = opcode_stream + 9;
     uint32_t *tbnz = find_next_insn(ldr + 1, 10,
         0x37100000 | (ldr[0] & 0x1f), 0xfff8001f);
     if(!tbnz)
@@ -66,6 +65,16 @@ static bool kpf_nvram_table_callback(struct xnu_pf_patch *patch, uint32_t *opcod
     nvram_patch_found = true;
     puts("KPF: Found NVRAM unlock");
     return true;
+}
+
+static bool kpf_nvram_table_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    return kpf_nvram_table_common_callback(patch, opcode_stream, opcode_stream + 9);
+}
+
+static bool kpf_nvram_table_xr_18710_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    return kpf_nvram_table_common_callback(patch, opcode_stream, opcode_stream + 13);
 }
 
 static void kpf_nvram_patches(xnu_pf_patchset_t *xnu_text_exec_patchset)
@@ -105,6 +114,31 @@ static void kpf_nvram_patches(xnu_pf_patchset_t *xnu_text_exec_patchset)
     xnu_pf_maskmatch(xnu_text_exec_patchset, "nvram_unlock", matches, masks,
         sizeof(matches) / sizeof(matches[0]), false,
         (void *)kpf_nvram_table_callback);
+
+    if(gKernelVersion.darwinMajor == 24 && gKernelVersion.darwinMinor == 6 &&
+       gKernelVersion.xnuMajor == 11417 && gKernelVersion.xnuMinor == 140 &&
+       gKernelVersion.xnuPatch == 69 && gKernelVersion.xnuFlags == 706 &&
+       gKernelVersion.xnuRevision == 66 && gKernelVersion.xnuRun == 1 &&
+       gKernelVersion.machineConfig == 0x8020 && xnu_platform() == PLATFORM_IOS)
+    {
+        // XR 18.7.10 uses the iOS 18.4-style table walker: the permission
+        // load is instruction 13, followed by a tbnz of its kernel-only bit.
+        uint64_t xr_matches[] = {
+            0x90000010, 0x91000210, 0x90000000, 0x91000000,
+            0xaa1003e1, 0x94000000, 0x340000c0, 0x91000200,
+            0xf9400200, 0xaa0003f0, 0xb5ffff40, 0x14000002,
+            0xaa1003e0, 0xf9400410,
+        };
+        uint64_t xr_masks[] = {
+            0x9f000010, 0xffc00210, 0x9f00001f, 0xffc003ff,
+            0xfff0ffff, 0xfc000000, 0xffffffff, 0xffc00210,
+            0xffc0021f, 0xfff0fff0, 0xffffffff, 0xffffffff,
+            0xfff0fff0, 0xfffffe10,
+        };
+        xnu_pf_maskmatch(xnu_text_exec_patchset, "nvram_unlock_xr_18710",
+            xr_matches, xr_masks, sizeof(xr_matches) / sizeof(xr_matches[0]),
+            false, (void *)kpf_nvram_table_xr_18710_callback);
+    }
 }
 
 static void kpf_nvram_finish(struct mach_header_64 *hdr)

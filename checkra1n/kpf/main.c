@@ -231,7 +231,11 @@ bool kpf_mac_mount_callback(struct xnu_pf_patch* patch, uint32_t* opcode_stream)
         mac_mount_1 = find_next_insn(mac_mount, 0x40, 0x3941c408, 0xFFFFFC1F);
     }
     if (!mac_mount_1) {
-        uint32_t* add = find_prev_insn(mac_mount, 0x40, 0x9101c108, 0xffffffff); // add x8, x8, #0x70
+        // iOS 18.7.10 on T8020 emits `add x8, x16, #0x70` here instead of
+        // `add x8, x8, #0x70`. Only Rd (x8) and the imm are load-bearing for
+        // the follow-up `ldr w8, [x8, #1]`; wildcard Rn so any input register
+        // matches.
+        uint32_t* add = find_prev_insn(mac_mount, 0x40, 0x9101c008, 0xfffffc1f); // add x8, xN, #0x70
         if (add && add[1] == 0x39400508) // ldr w8, [x8, #0x1]
             mac_mount_1 = &add[1];
     }
@@ -2216,7 +2220,10 @@ void kpf_md0oncores_patch(xnu_pf_patchset_t* patchset)
 {
     uint64_t matches[] =
     {
-        0xd73f0910, // blraa x8, x16
+        // iOS 18.7.10 arm64e uses blraa x9, x17 here (not x8, x16). Burnegg's
+        // tvOS 26.3 fix 0bcdeed broadened the Rm nibble; iOS 18 also varies the
+        // Rn nibble, so we wildcard the whole lower 10 bits of the BLRAA.
+        0xd73f0800, // blraa xN, xM (any pointer reg, any modifier reg)
         0x52805828, // mov  w8, #0x2c1
         0x72bc0008, // movk w8, #0xe000, lsl #16
         0x6b08001f, // cmp  wN, w8
@@ -2224,7 +2231,7 @@ void kpf_md0oncores_patch(xnu_pf_patchset_t* patchset)
     };
     uint64_t masks[] =
     {
-        0xffffffff,
+        0xfffffc00, // keep opcode, mask out Rn (bits 9:5) and Rm (bits 4:0)
         0xffffffff,
         0xffffffff,
         0xfffffc1f,

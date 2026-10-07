@@ -226,6 +226,23 @@ static bool kpf_shared_region_root_dir_fileset_callback(struct xnu_pf_patch *pat
     return true;
 }
 
+static bool kpf_shared_region_root_dir_xr_18710_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    if(found_shared_region_root_dir)
+    {
+        panic("kpf_shared_region_root_dir: Found twice");
+    }
+
+    // XR 18.7.10 keeps the incoming root-directory vnode (x7) in x25.
+    // vm_shared_region_root_dir() returns the shared-region root vnode in x0;
+    // the following b.eq reaches the existing success path when they match.
+    opcode_stream[2] = 0xeb00001f; // cmp x0, x0
+    found_shared_region_root_dir = true;
+
+    puts("KPF: Found shared region root dir (XR 18.7.10)");
+    return true;
+}
+
 static void kpf_shared_region_root_dir_patch(xnu_pf_patchset_t *xnu_text_exec_patchset)
 {
     // Doing bind mounts means the shared cache is not on the volume mounted at /.
@@ -293,6 +310,31 @@ static void kpf_shared_region_root_dir_patch(xnu_pf_patchset_t *xnu_text_exec_pa
         0xff00001f,
     };
     xnu_pf_maskmatch(xnu_text_exec_patchset, "shared_region_root_dir_fileset", fileset_matches, fileset_masks, sizeof(fileset_matches)/sizeof(uint64_t), false, (void*)kpf_shared_region_root_dir_fileset_callback);
+
+    if(gKernelVersion.darwinMajor == 24 && gKernelVersion.darwinMinor == 6 &&
+       gKernelVersion.xnuMajor == 11417 && gKernelVersion.xnuMinor == 140 &&
+       gKernelVersion.xnuPatch == 69 && gKernelVersion.xnuFlags == 706 &&
+       gKernelVersion.xnuRevision == 66 && gKernelVersion.xnuRun == 1 &&
+       gKernelVersion.machineConfig == 0x8020 && xnu_platform() == PLATFORM_IOS)
+    {
+        // iPhone11,8 18.7.10 (22H374): the helper call is followed by
+        // cbz x0, fallback; cmp x0, x25; b.eq success.  The incoming x7
+        // was saved into x25 in the function prologue.  This signature has
+        // one match in the verified kernelcache, at 0xfffffff008399b4c.
+        uint64_t xr_matches[] = {
+            0x94000000, // bl vm_shared_region_root_dir
+            0xb4000000, // cbz x0, fallback
+            0xeb19001f, // cmp x0, x25
+            0x54000000, // b.eq success
+        };
+        uint64_t xr_masks[] = {
+            0xfc000000,
+            0xff00001f,
+            0xffffffff,
+            0xff00001f,
+        };
+        xnu_pf_maskmatch(xnu_text_exec_patchset, "shared_region_root_dir_xr_18710", xr_matches, xr_masks, sizeof(xr_matches)/sizeof(uint64_t), false, (void*)kpf_shared_region_root_dir_xr_18710_callback);
+    }
 }
 
 static void kpf_bindfs_patches(xnu_pf_patchset_t *xnu_text_exec_patchset)

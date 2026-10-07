@@ -31,6 +31,40 @@
 static bool found_ppl_debugger_mapping = false;
 
 static bool
+kpf_ppl_debugger_mapping_ios18_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    // iOS 18 variant: the baseline cbz/mov/b triple is replaced by
+    //   cmp w0, #0 ; cset wN, eq ; b .+imm
+    // and the subsequent allow/deny decision reads wN downstream. Force
+    // success by rewriting `cset wN, eq` into `mov wN, #1`. Keep the PAC
+    // call and surrounding frame intact so authentication state is sound.
+    if(found_ppl_debugger_mapping)
+    {
+        // Older matcher already succeeded; don't double-patch.
+        return false;
+    }
+
+    uint64_t entitlement_va =
+        (xnu_ptr_to_va(opcode_stream + 1) & ~0xfffULL) +
+        adrp_off(opcode_stream[1]) +
+        ((opcode_stream[2] >> 10) & 0xfff);
+    const char *entitlement = xnu_va_to_ptr(entitlement_va);
+    if(strcmp(entitlement, "com.apple.private.cs.debugger") != 0)
+    {
+        return false;
+    }
+
+    // cset wN, eq -> mov wN, #1 (MOVZ Wd, #1, lsl 0)
+    uint32_t rd = opcode_stream[6] & 0x1fu;
+    opcode_stream[6] = 0x52800020u | rd;
+
+    found_ppl_debugger_mapping = true;
+    xnu_pf_disable_patch(patch);
+    puts("KPF: Found PPL debugger mapping entitlement gate (iOS 18)");
+    return true;
+}
+
+static bool
 kpf_ppl_debugger_mapping_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
 {
     /*
@@ -243,6 +277,41 @@ static void kpf_vm_prot_patches(xnu_pf_patchset_t *xnu_text_exec_patchset)
     xnu_pf_maskmatch(xnu_text_exec_patchset, "ppl_debugger_mapping",
         matches, masks, sizeof(matches) / sizeof(uint64_t), false,
         (void *)kpf_ppl_debugger_mapping_callback);
+
+    // iOS 18.7.10 restructures the entitlement gate. The old code was
+    //   cbz w0, .associate_cow ; mov w0, #KERN_DENIED ; b .return
+    // Observed on iPhone11,8 22H374 at VA 0xfffffff0083288c4 it is
+    //   cmp w0, #0 ; cset wN, eq ; b .+8
+    // and the allow/deny decision is pushed downstream via wN. The LDR
+    // vtable offset also moved from 0x1c0 to 0x1b0 and the BLRAA uses
+    // register pairs beyond (x8,x16). Match that iOS 18 shape and in the
+    // callback overwrite `cset wN, eq` with `mov wN, #1` so the downstream
+    // consumer treats the entitlement query as always-successful.
+    uint64_t ios18_matches[] =
+    {
+        0xf9400108, // ldr x8, [x8, #imm]
+        0x90000001, // adrp x1, entitlement
+        0x91000021, // add x1, x1, #...
+        0xd2800011, // mov x17, discriminator
+        0xd73f0800, // blraa xN, xM (any pointer reg, any modifier reg)
+        0x7100001f, // cmp w0, #0
+        0x1a9f17e0, // cset wN, eq
+        0x14000000, // b .+imm
+    };
+    uint64_t ios18_masks[] =
+    {
+        0xffc003ff, // keep opcode + Rt=x8 + Rn=x8, wildcard imm12
+        0x9f00001f,
+        0xffc003ff,
+        0xffe0001f,
+        0xfffffc00, // keep opcode, wildcard Rn (9:5) + Rm (4:0)
+        0xffffffff,
+        0xffffffe0, // keep opcode + cond=EQ + Rn=Rm=WZR, wildcard Rd
+        0xfc000000,
+    };
+    xnu_pf_maskmatch(xnu_text_exec_patchset, "ppl_debugger_mapping_ios18",
+        ios18_matches, ios18_masks, sizeof(ios18_matches) / sizeof(uint64_t), false,
+        (void *)kpf_ppl_debugger_mapping_ios18_callback);
 }
 
 static void kpf_vm_prot_finish(struct mach_header_64 *hdr)

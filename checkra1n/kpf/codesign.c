@@ -87,6 +87,25 @@ kpf_ppl_allow_invalid_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stre
     return true;
 }
 
+static bool
+kpf_ppl_allow_invalid_xr_18710_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    if(found_ppl_allow_invalid)
+    {
+        panic("kpf_ppl_allow_invalid: Found more than one pmap initializer");
+    }
+
+    // XR 18.7.10 initializes +0xc1 and +0xc2 with separate byte stores.
+    // w8 is already 1 and is later used to initialize the pmap refcount;
+    // change only the allow-invalid byte store, not the w8 producer.
+    opcode_stream[11] = 0x39030a68; // strb w8, [x19, #0xc2]
+
+    found_ppl_allow_invalid = true;
+    xnu_pf_disable_patch(patch);
+    puts("KPF: Found PPL pmap allow-invalid producer (XR 18.7.10)");
+    return true;
+}
+
 static void
 kpf_ppl_allow_invalid_patches(xnu_pf_patchset_t *ppl_text_patchset)
 {
@@ -126,6 +145,42 @@ kpf_ppl_allow_invalid_patches(xnu_pf_patchset_t *ppl_text_patchset)
     xnu_pf_maskmatch(ppl_text_patchset, "ppl_pmap_allow_invalid",
         matches, masks, sizeof(matches) / sizeof(uint64_t), false,
         (void *)kpf_ppl_allow_invalid_callback);
+
+    if(gKernelVersion.darwinMajor == 24 && gKernelVersion.darwinMinor == 6 &&
+       gKernelVersion.xnuMajor == 11417 && gKernelVersion.xnuMinor == 140 &&
+       gKernelVersion.xnuPatch == 69 && gKernelVersion.xnuFlags == 706 &&
+       gKernelVersion.xnuRevision == 66 && gKernelVersion.xnuRun == 1 &&
+       gKernelVersion.machineConfig == 0x8020 && xnu_platform() == PLATFORM_IOS)
+    {
+        // iPhone11,8 18.7.10 (22H374), __PPLTEXT at 0xfffffff008608d40.
+        // This exact sequence occurs once in the verified kernelcache.
+        uint64_t xr_matches[] = {
+            0x6f00e400, // movi.2d v0, #0
+            0x3c858260, // stur q0, [x19, #0x58]
+            0xf9003e7f, // str xzr, [x19, #0x78]
+            0xb900827f, // str wzr, [x19, #0x80]
+            0x3903167f, // strb wzr, [x19, #0xc5]
+            0x39031a7f, // strb wzr, [x19, #0xc6]
+            0x3c888260, // stur q0, [x19, #0x88]
+            0x3d802a60, // str q0, [x19, #0xa0]
+            0x3902627f, // strb wzr, [x19, #0x98]
+            0x52800028, // mov w8, #1
+            0x39030668, // strb w8, [x19, #0xc1]
+            0x39030a7f, // strb wzr, [x19, #0xc2]
+            0x2916fe7f, // stp wzr, wzr, [x19, #0xb4]
+            0xd5033bbf, // dmb ish
+            0xb900b268, // str w8, [x19, #0xb0]
+        };
+        uint64_t xr_masks[] = {
+            0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff,
+            0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff,
+            0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff,
+            0xffffffff, 0xffffffff, 0xffffffff,
+        };
+        xnu_pf_maskmatch(ppl_text_patchset, "ppl_pmap_allow_invalid_xr_18710",
+            xr_matches, xr_masks, sizeof(xr_matches) / sizeof(uint64_t), false,
+            (void *)kpf_ppl_allow_invalid_xr_18710_callback);
+    }
 }
 
 static void

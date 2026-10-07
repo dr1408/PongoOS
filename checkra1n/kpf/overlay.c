@@ -219,7 +219,59 @@ static bool kpf_overlay_kdi_fileset_get_callback(struct xnu_pf_patch *patch, uin
     return false;
 }
 
-static bool kpf_overlay_kdi_fileset_set_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+// iOS 18.7.10 arm64e variant of kpf_overlay_kdi_fileset_get_callback.
+// Compared to the baseline callback this shifts ADRP/ADD indices by +1
+// (because the matcher window includes an extra `mov Xd, x16` after the
+// `ldr x8, [x16]`), and broadens the forward BLRAA search to accept any
+// (pointer, modifier) register pair - iOS 18 observed `blraa x8, x17` here.
+static bool kpf_overlay_kdi_fileset_get_ios18_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    uint64_t page = ((uint64_t)(opcode_stream + 4) & ~0xfffULL) + adrp_off(opcode_stream[4]);
+    uint32_t off = (opcode_stream[5] >> 10) & 0xfff;
+    const char *str = (const char*)(page + off);
+    if(strcmp(str, "image-secrets")) return false;
+
+    uint16_t index = ((opcode_stream[0] >> 5) & 0xffff) / sizeof(uint64_t);
+    uint32_t *autda = find_prev_insn(opcode_stream, 8, 0xdac11810, 0xfffffc1f); // autda x16, xN
+    uint32_t modifier_reg = autda ? ((*autda >> 5) & 0x1f) : 0;
+    uint32_t *vtable_movk = autda ? find_prev_movk48(autda, 4, modifier_reg) : NULL;
+    uint32_t *blraa = find_next_insn(opcode_stream + 5, 5, 0xd73f0800, 0xfffffc00); // blraa xN, xM
+    uint32_t blraa_rm = blraa ? (*blraa & 0x1f) : 0;
+    uint32_t *call_movk = blraa ? find_prev_movk48(blraa, 4, blraa_rm) : NULL;
+    if(!call_movk)
+    {
+        return false;
+    }
+
+    if(!OSDictionary_getObject_idx)
+    {
+        if(!vtable_movk)
+        {
+            return false;
+        }
+        OSDictionary_getObject_idx = index;
+        OSDictionary_vtable_discriminator = movk_imm16(*vtable_movk);
+        OSDictionary_getObject_discriminator = movk_imm16(*call_movk);
+        return false;
+    }
+
+    uint32_t *bl = blraa ? find_next_insn(blraa + 1, 16, 0x94000000, 0xfc000000) : NULL;
+    if(!bl || (bl[1] & 0xff00001f) != 0xb5000000) // cbnz x0
+    {
+        return false;
+    }
+
+    kdi_patchpoint = bl;
+    if(OSDictionary_setObject_idx)
+    {
+        puts("KPF: Found KDI (fileset iOS 18)");
+        return true;
+    }
+    return false;
+}
+
+static bool kpf_overlay_kdi_fileset_set_common_callback(struct xnu_pf_patch *patch,
+    uint32_t *opcode_stream, bool xr_18710)
 {
     uint64_t page = ((uint64_t)(opcode_stream + 2) & ~0xfffULL) + adrp_off(opcode_stream[2]);
     uint32_t off = (opcode_stream[3] >> 10) & 0xfff;
@@ -232,8 +284,11 @@ static bool kpf_overlay_kdi_fileset_set_callback(struct xnu_pf_patch *patch, uin
 
     uint32_t *release_autda = set_blraa ? find_next_insn(set_blraa + 1, 12, 0xdac11a30, 0xffffffff) : NULL;
     uint32_t *release_vtable_movk = release_autda ? find_prev_movk48(release_autda, 4, 17) : NULL;
-    uint32_t *release_blraa = release_autda ? find_next_insn(release_autda + 1, 12, 0xd73f0910, 0xffffffff) : NULL;
-    uint32_t *release_call_movk = release_blraa ? find_prev_movk48(release_blraa, 4, 16) : NULL;
+    // XR 18.7.10 uses blraa x9, x17 here; the tvOS fileset uses x8, x16.
+    uint32_t *release_blraa = release_autda ? find_next_insn(release_autda + 1, 12,
+        xr_18710 ? 0xd73f0931 : 0xd73f0910, 0xffffffff) : NULL;
+    uint32_t *release_call_movk = release_blraa ? find_prev_movk48(release_blraa, 4,
+        xr_18710 ? 17 : 16) : NULL;
     if(!set_call_movk || !release_vtable_movk || !release_call_movk)
     {
         return false;
@@ -249,6 +304,16 @@ static bool kpf_overlay_kdi_fileset_set_callback(struct xnu_pf_patch *patch, uin
         return true;
     }
     return false;
+}
+
+static bool kpf_overlay_kdi_fileset_set_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    return kpf_overlay_kdi_fileset_set_common_callback(patch, opcode_stream, false);
+}
+
+static bool kpf_overlay_kdi_fileset_set_xr_18710_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    return kpf_overlay_kdi_fileset_set_common_callback(patch, opcode_stream, true);
 }
 
 static void kpf_overlay_kdi_patch(xnu_pf_patchset_t *kdi_text_exec_patchset)
@@ -285,6 +350,30 @@ static void kpf_overlay_kdi_patch(xnu_pf_patchset_t *kdi_text_exec_patchset)
     };
     xnu_pf_maskmatch(kdi_text_exec_patchset, "KDI_fileset_get", fileset_get_matches, fileset_get_masks, sizeof(fileset_get_matches)/sizeof(uint64_t), false, (void*)kpf_overlay_kdi_fileset_get_callback);
 
+    // iOS 18.7.10 arm64e inserts a `MOV Xd, x16` between `ldr x8, [x16]` and
+    // `adrp x1, string`. Match the 6-insn variant separately so the KDI get
+    // path resolves on iOS 18 kernels. The dedicated ios18 callback shifts the
+    // adrp/add indices by +1 and broadens the forward BLRAA search.
+    uint64_t fileset_get_ios18_matches[] =
+    {
+        0xd2800011, // mov x17, vtable byte offset
+        0x8b110210, // add x16, x16, x17
+        0xf9400208, // ldr x8, [x16]
+        0xaa1003e0, // mov Xd, x16 (ORR Xd, XZR, X16)
+        0x90000001, // adrp x1, string
+        0x91000021, // add x1, x1, string offset
+    };
+    uint64_t fileset_get_ios18_masks[] =
+    {
+        0xff80001f,
+        0xffffffff,
+        0xffffffff,
+        0xffffffe0, // keep opcode + Rm=16 + Rn=XZR, wildcard Rd
+        0x9f00001f,
+        0xffc003ff,
+    };
+    xnu_pf_maskmatch(kdi_text_exec_patchset, "KDI_fileset_get_ios18", fileset_get_ios18_matches, fileset_get_ios18_masks, sizeof(fileset_get_ios18_matches)/sizeof(uint64_t), false, (void*)kpf_overlay_kdi_fileset_get_ios18_callback);
+
     uint64_t fileset_set_matches[] =
     {
         0x91000208, // add x8, x16, vtable byte offset
@@ -299,7 +388,24 @@ static void kpf_overlay_kdi_patch(xnu_pf_patchset_t *kdi_text_exec_patchset)
         0x9f00001f,
         0xffc003ff,
     };
-    xnu_pf_maskmatch(kdi_text_exec_patchset, "KDI_fileset_set", fileset_set_matches, fileset_set_masks, sizeof(fileset_set_matches)/sizeof(uint64_t), false, (void*)kpf_overlay_kdi_fileset_set_callback);
+    if(gKernelVersion.darwinMajor == 24 && gKernelVersion.darwinMinor == 6 &&
+       gKernelVersion.xnuMajor == 11417 && gKernelVersion.xnuMinor == 140 &&
+       gKernelVersion.xnuPatch == 69 && gKernelVersion.xnuFlags == 706 &&
+       gKernelVersion.xnuRevision == 66 && gKernelVersion.xnuRun == 1 &&
+       gKernelVersion.machineConfig == 0x8020 && xnu_platform() == PLATFORM_IOS)
+    {
+        xnu_pf_maskmatch(kdi_text_exec_patchset, "KDI_fileset_set_xr_18710",
+            fileset_set_matches, fileset_set_masks,
+            sizeof(fileset_set_matches)/sizeof(uint64_t), false,
+            (void*)kpf_overlay_kdi_fileset_set_xr_18710_callback);
+    }
+    else
+    {
+        xnu_pf_maskmatch(kdi_text_exec_patchset, "KDI_fileset_set",
+            fileset_set_matches, fileset_set_masks,
+            sizeof(fileset_set_matches)/sizeof(uint64_t), false,
+            (void*)kpf_overlay_kdi_fileset_set_callback);
+    }
 }
 
 static void kpf_overlay_xnu_patches(xnu_pf_patchset_t *xnu_text_exec_patchset)
