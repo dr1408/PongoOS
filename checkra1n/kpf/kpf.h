@@ -125,6 +125,7 @@ extern kpf_component_t kpf_dyld;
 extern kpf_component_t kpf_launch_constraints;
 extern kpf_component_t kpf_mach_port;
 extern kpf_component_t kpf_nvram;
+extern kpf_component_t kpf_panic_detail;
 extern kpf_component_t kpf_overlay;
 extern kpf_component_t kpf_ramdisk;
 extern kpf_component_t kpf_spawn_validate_persona;

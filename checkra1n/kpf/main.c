@@ -2430,6 +2430,7 @@ static void kpf_cmd(void)
         &kpf_launch_constraints,
         &kpf_mach_port,
         &kpf_nvram,
+        &kpf_panic_detail,
         &kpf_shellcode,
         &kpf_overlay,
         &kpf_ramdisk,
