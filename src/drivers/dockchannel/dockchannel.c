@@ -39,7 +39,18 @@ static inline void put_dockchannel_modifier(const char* str) {
 
 void dockchannel_init(void)
 {
-    if (socnum != 0x8012)
+    /*
+     * T8020 iBoot uses the same dockchannel UART register interface as T8012:
+     *   TX data        at base + 0x4004
+     *   TX free count  at base + 0x4014
+     * The base remains device-tree supplied because it is SoC-specific
+     * (resolved from /arm-io/dockchannel-uart below).
+     *
+     * Enabling T8020 here lets the laika/Pongo chain emit console output on
+     * DCSD without needing an iBoot-side bridge.  Ported from burnegg's
+     * Fauxly/PongoOS commit 0f7e4ba.
+     */
+    if (socnum != 0x8012 && socnum != 0x8020)
         return;
 
     dt_node_t *node = dt_get("/arm-io/dockchannel-uart");
