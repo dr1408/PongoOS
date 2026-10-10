@@ -2434,6 +2434,7 @@ static void kpf_cmd(void)
         &kpf_shellcode,
         &kpf_overlay,
         &kpf_ramdisk,
+        &kpf_sep_credential_shim,
         &kpf_spawn_validate_persona,
         &kpf_success_no_blob,
         &kpf_trustcache,
