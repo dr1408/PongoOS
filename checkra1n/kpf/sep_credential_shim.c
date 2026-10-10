@@ -162,12 +162,29 @@ kpf_sep_credential_shim_finish(struct mach_header_64 *hdr)
     }
 }
 
+/*
+ * The methods we shim live in 5 separate kexts on XR 18.7.10:
+ *   com.apple.driver.AppleSEPCredentialManager (12 hits — main class)
+ *   com.apple.driver.AppleIDV                  (6 hits — thunk + methods)
+ *   com.apple.driver.AppleSSE                  (2 hits — handleSEPMessage,
+ *                                                        getSEPEndpoint)
+ *   com.apple.driver.ApplePearlSEPDriver       (1 hit  — handleSEPMessage)
+ *   com.apple.iokit.AppleSEPGenericTransfer    (1 hit  — handleSEPMessage new1)
+ *
+ * NULL (main kernel) is intentionally omitted — none of these methods live
+ * in the main kernel, and scanning the main kernel's __TEXT_EXEC would just
+ * burn match time with zero hits.
+ */
 kpf_component_t kpf_sep_credential_shim =
 {
     .finish = kpf_sep_credential_shim_finish,
     .patches =
     {
-        { NULL, "__TEXT_EXEC", "__text", XNU_PF_ACCESS_32BIT, kpf_sep_credential_shim_patch },
+        { "com.apple.driver.AppleSEPCredentialManager", "__TEXT_EXEC", "__text", XNU_PF_ACCESS_32BIT, kpf_sep_credential_shim_patch },
+        { "com.apple.driver.AppleIDV",                  "__TEXT_EXEC", "__text", XNU_PF_ACCESS_32BIT, kpf_sep_credential_shim_patch },
+        { "com.apple.driver.AppleSSE",                  "__TEXT_EXEC", "__text", XNU_PF_ACCESS_32BIT, kpf_sep_credential_shim_patch },
+        { "com.apple.driver.ApplePearlSEPDriver",       "__TEXT_EXEC", "__text", XNU_PF_ACCESS_32BIT, kpf_sep_credential_shim_patch },
+        { "com.apple.iokit.AppleSEPGenericTransfer",    "__TEXT_EXEC", "__text", XNU_PF_ACCESS_32BIT, kpf_sep_credential_shim_patch },
         {},
     },
 };
