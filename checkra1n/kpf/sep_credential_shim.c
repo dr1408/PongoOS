@@ -72,6 +72,17 @@ kpf_sep_credential_shim_callback(struct xnu_pf_patch *patch, uint32_t *opcode_st
     (void)patch;
     uint32_t adrp = opcode_stream[0];
     uint32_t add  = opcode_stream[1];
+
+    /* Require ADRP Rd == ADD Rn == ADD Rd (same register for the whole pair).
+     * The maskmatch below is deliberately loose on the Rd bits (the method
+     * name string is loaded into x1 / x2 / x8 depending on the printf arg
+     * position, not just x0), so we enforce register equality here instead
+     * of in the mask. */
+    unsigned rd_adrp = adrp & 0x1f;
+    unsigned rd_add  = add & 0x1f;
+    unsigned rn_add  = (add >> 5) & 0x1f;
+    if (rd_adrp != rd_add || rd_adrp != rn_add) return false;
+
     const char *str = (const char *)(((uint64_t)opcode_stream & ~0xfffULL)
                                      + adrp_off(adrp)
                                      + ((add >> 10) & 0xfff));
@@ -130,13 +141,13 @@ kpf_sep_credential_shim_patch(xnu_pf_patchset_t *xnu_text_exec_patchset)
 {
     uint64_t matches[] =
     {
-        0x90000000, /* adrp xN, ... */
-        0x91000000, /* add  xN, xN, #imm12 (same reg) */
+        0x90000000, /* adrp xN, ...   (any Rd) */
+        0x91000000, /* add  xN, xN, #imm12   (any Rd/Rn — callback checks equality) */
     };
     uint64_t masks[] =
     {
-        0x9f00001f,
-        0xffc003ff,
+        0x9f000000, /* keep ADRP opcode only, allow any Rd and immediate */
+        0xffc00000, /* keep ADD opcode + sh/22, allow any Rd, Rn, imm12 */
     };
     xnu_pf_maskmatch(xnu_text_exec_patchset, "sep_credential_shim",
         matches, masks, sizeof(matches)/sizeof(uint64_t), false,
