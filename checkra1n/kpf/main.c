@@ -2435,6 +2435,7 @@ static void kpf_cmd(void)
         &kpf_overlay,
         &kpf_ramdisk,
         &kpf_spawn_validate_persona,
+        &kpf_success_no_blob,
         &kpf_trustcache,
         &kpf_vfs,
         &kpf_vm_prot,

@@ -129,6 +129,7 @@ extern kpf_component_t kpf_panic_detail;
 extern kpf_component_t kpf_overlay;
 extern kpf_component_t kpf_ramdisk;
 extern kpf_component_t kpf_spawn_validate_persona;
+extern kpf_component_t kpf_success_no_blob;
 extern kpf_component_t kpf_trustcache;
 extern kpf_component_t kpf_vfs;
 extern kpf_component_t kpf_vm_prot;
