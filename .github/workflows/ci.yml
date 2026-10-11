@@ -1,11 +1,7 @@
 name: Build KPF & Pongo
 
 on:
-  # Trigger on all pushes and pull requests
-  push:
-  pull_request:
-
-  # Allows you to run this workflow manually from the Actions tab
+  # Manual trigger only
   workflow_dispatch:
 
 jobs:
