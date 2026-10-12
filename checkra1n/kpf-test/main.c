@@ -45,11 +45,79 @@
 #include <libkern/OSCacheControl.h>
 
 static FILE *kpf_audit_report;
+#define KPF_TEST_CALLBACK_WINDOW 0x4000
+static uint8_t kpf_callback_before[KPF_TEST_CALLBACK_WINDOW];
+static uintptr_t kpf_callback_window_start;
+static size_t kpf_callback_window_size;
+static uint64_t kpf_callback_candidate_va;
+static uintptr_t kpf_callback_candidate_ptr;
+static const char *kpf_callback_name;
+static uintptr_t kpf_kernel_map_start;
+static uintptr_t kpf_kernel_map_end;
 static struct {
     const char *name;
     uint64_t rejected;
 } kpf_rejected_matches[256];
 static size_t kpf_rejected_match_count;
+
+void kpf_test_callback_begin(const char *name, uint64_t va, void *candidate)
+{
+    uintptr_t p = (uintptr_t)candidate;
+    uintptr_t start = p & ~(uintptr_t)(KPF_TEST_CALLBACK_WINDOW - 1);
+    uintptr_t end = start + KPF_TEST_CALLBACK_WINDOW;
+    if(start < kpf_kernel_map_start) start = kpf_kernel_map_start;
+    if(end > kpf_kernel_map_end) end = kpf_kernel_map_end;
+    kpf_callback_name = name ? name : "<unnamed>";
+    kpf_callback_candidate_va = va;
+    kpf_callback_candidate_ptr = p;
+    kpf_callback_window_start = start;
+    kpf_callback_window_size = end > start ? end - start : 0;
+    if(kpf_callback_window_size)
+        memcpy(kpf_callback_before, (const void*)start, kpf_callback_window_size);
+}
+
+void kpf_test_callback_end(bool accepted, bool has_fired)
+{
+    if(!kpf_callback_window_size) return;
+    const uint8_t *after = (const uint8_t*)kpf_callback_window_start;
+    size_t changes = 0;
+    for(size_t i = 0; i < kpf_callback_window_size; ++i)
+        if(kpf_callback_before[i] != after[i]) ++changes;
+    if(changes)
+    {
+        printf("KPF_TEST_CALLBACK_LOCAL_DIFF\t%s\tcandidate=0x%llx\taccepted=%s\tfired=%s\tchanged_bytes=%zu\n",
+               kpf_callback_name, (unsigned long long)kpf_callback_candidate_va,
+               accepted ? "yes" : "no", has_fired ? "yes" : "no", changes);
+        if(kpf_audit_report)
+            fprintf(kpf_audit_report,
+                    "CALLBACK_LOCAL_DIFF\t%s\t0x%llx\taccepted=%s\tfired=%s\tchanged_bytes=%zu\n",
+                    kpf_callback_name, (unsigned long long)kpf_callback_candidate_va,
+                    accepted ? "yes" : "no", has_fired ? "yes" : "no", changes);
+        for(size_t i = 0; i < kpf_callback_window_size;)
+        {
+            if(kpf_callback_before[i] == after[i]) { ++i; continue; }
+            size_t begin = i++;
+            while(i < kpf_callback_window_size && kpf_callback_before[i] != after[i]) ++i;
+            size_t n = i - begin;
+            int64_t delta = (int64_t)(kpf_callback_window_start + begin) -
+                            (int64_t)kpf_callback_candidate_ptr;
+            uint64_t write_va = kpf_callback_candidate_va + delta;
+            if(kpf_audit_report)
+            {
+                fprintf(kpf_audit_report, "CALLBACK_WRITE\t%s\t0x%llx\tspan=%zu\tbefore=",
+                        kpf_callback_name, (unsigned long long)write_va, n);
+                for(size_t j = 0; j < n && j < 64; ++j) fprintf(kpf_audit_report, "%02x", kpf_callback_before[begin + j]);
+                if(n > 64) fputs("...", kpf_audit_report);
+                fputs("\tafter=", kpf_audit_report);
+                for(size_t j = 0; j < n && j < 64; ++j) fprintf(kpf_audit_report, "%02x", after[begin + j]);
+                if(n > 64) fputs("...", kpf_audit_report);
+                fputc('\n', kpf_audit_report);
+            }
+        }
+        if(kpf_audit_report) fflush(kpf_audit_report);
+    }
+    kpf_callback_window_size = 0;
+}
 
 /* Called by the KPF matcher only in the host test build. Accepted callback
  * candidates are recorded individually; rejected candidates are aggregated
@@ -800,6 +868,8 @@ static void __attribute__((noreturn)) process_kernel(int fd)
     }
     memset(patch_snapshot, 0, mlen);
     snapshot_kernel_segments(patch_snapshot, mem, lowest, hdr);
+    kpf_kernel_map_start = (uintptr_t)mem;
+    kpf_kernel_map_end = (uintptr_t)mem + mlen;
 
     const char *report_path = getenv("KPF_TEST_PATCH_REPORT");
     if(!report_path || !report_path[0]) report_path = "kpf-patch-report.tsv";
@@ -811,8 +881,11 @@ static void __attribute__((noreturn)) process_kernel(int fd)
     }
     fprintf(kpf_audit_report,
             "# Accepted callback candidates are listed individually; rejected candidates are counted per patch.\n"
+            "# CALLBACK_WRITE rows are changes in the candidate's 16-KiB window only; out-of-window writes remain in the global DIFF.\n"
             "# DIFF rows are final byte changes and are not attributed to a callback.\n"
             "# MATCH\tpatch_name\tcandidate_va\tcallback_result\thas_fired\n"
+            "# CALLBACK_LOCAL_DIFF\tpatch_name\tcandidate_va\taccepted\tfired\tchanged_bytes\n"
+            "# CALLBACK_WRITE\tpatch_name\twrite_va\tspan\tbefore_hex\tafter_hex\n"
             "# MATCH_REJECTED_SUMMARY\tpatch_name\tcount\n");
     fflush(kpf_audit_report);
 

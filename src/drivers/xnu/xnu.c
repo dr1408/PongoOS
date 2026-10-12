@@ -896,13 +896,20 @@ void xnu_pf_maskmatch_match(struct xnu_pf_maskmatch* patch, uint8_t access_type,
     }
     if (val) {
         jit_set_exec(0);
+#ifdef KPF_TEST
+        extern void kpf_test_callback_begin(const char*, uint64_t, void*);
+        extern void kpf_test_callback_end(bool, bool);
+        uint64_t candidate_va = xnu_ptr_to_va(cacheable_stream);
+        kpf_test_callback_begin(patch->patch.name, candidate_va, cacheable_stream);
+#endif
         bool accepted = patch->patch.pf_callback((struct xnu_pf_patch *)patch, cacheable_stream);
         if (accepted) {
             patch->patch.has_fired = true;
         }
 #ifdef KPF_TEST
         extern void kpf_test_record_match(const char*, uint64_t, bool, bool);
-        kpf_test_record_match(patch->patch.name, xnu_ptr_to_va(cacheable_stream),
+        kpf_test_callback_end(accepted, patch->patch.has_fired);
+        kpf_test_record_match(patch->patch.name, candidate_va,
                               accepted, patch->patch.has_fired);
 #endif
         jit_set_exec(1);
@@ -932,13 +939,20 @@ void xnu_pf_ptr_to_data_match(struct xnu_pf_ptr_to_datamatch* patch, uint8_t acc
     if (pointer >= patch->range->va && pointer < (patch->range->va + patch->range->size)) {
         if (memcmp(patch->data, (void*)(pointer - patch->range->va + patch->range->cacheable_base), patch->datasz) == 0) {
             jit_set_exec(0);
+#ifdef KPF_TEST
+            extern void kpf_test_callback_begin(const char*, uint64_t, void*);
+            extern void kpf_test_callback_end(bool, bool);
+            uint64_t candidate_va = xnu_ptr_to_va(cacheable_stream);
+            kpf_test_callback_begin(patch->patch.name, candidate_va, cacheable_stream);
+#endif
             bool accepted = patch->patch.pf_callback((struct xnu_pf_patch *)patch, cacheable_stream);
             if (accepted) {
                 patch->patch.has_fired = true;
             }
 #ifdef KPF_TEST
             extern void kpf_test_record_match(const char*, uint64_t, bool, bool);
-            kpf_test_record_match(patch->patch.name, xnu_ptr_to_va(cacheable_stream),
+            kpf_test_callback_end(accepted, patch->patch.has_fired);
+            kpf_test_record_match(patch->patch.name, candidate_va,
                                   accepted, patch->patch.has_fired);
 #endif
             jit_set_exec(1);
