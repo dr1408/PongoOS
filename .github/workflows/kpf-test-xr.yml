@@ -111,3 +111,12 @@ jobs:
         run: |
           cd checkra1n/kpf-test
           ./kpf-test.macos -v ../../kc/kernelcache.decompressed
+
+      - name: Upload KPF patch report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kpf-patch-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: checkra1n/kpf-test/kpf-patch-report.tsv
+          if-no-files-found: warn
+          retention-days: 30
