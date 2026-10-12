@@ -45,13 +45,38 @@
 #include <libkern/OSCacheControl.h>
 
 static FILE *kpf_audit_report;
+static struct {
+    const char *name;
+    uint64_t rejected;
+} kpf_rejected_matches[256];
+static size_t kpf_rejected_match_count;
 
-/* Called by the KPF matcher only in the host test build. This records a
- * candidate match, not proof that the callback modified bytes at this VA. */
+/* Called by the KPF matcher only in the host test build. Accepted callback
+ * candidates are recorded individually; rejected candidates are aggregated
+ * by patch name. Neither is proof that the callback modified bytes at this VA. */
 void kpf_test_record_match(const char *name, uint64_t va,
                            bool callback_result, bool has_fired)
 {
     if(!name) name = "<unnamed>";
+    if(!callback_result)
+    {
+        for(size_t i = 0; i < kpf_rejected_match_count; ++i)
+        {
+            if(strcmp(kpf_rejected_matches[i].name, name) == 0)
+            {
+                ++kpf_rejected_matches[i].rejected;
+                return;
+            }
+        }
+        if(kpf_rejected_match_count <
+           sizeof(kpf_rejected_matches) / sizeof(kpf_rejected_matches[0]))
+        {
+            kpf_rejected_matches[kpf_rejected_match_count].name = name;
+            kpf_rejected_matches[kpf_rejected_match_count].rejected = 1;
+            ++kpf_rejected_match_count;
+        }
+        return;
+    }
     printf("KPF_TEST_MATCH\t%s\t0x%llx\tcallback=%s\tfired=%s\n", name,
            (unsigned long long)va, callback_result ? "accepted" : "rejected",
            has_fired ? "yes" : "no");
@@ -258,6 +283,12 @@ static void report_kernel_patches(const uint8_t *before, const void *mem,
 #define AUDIT_PUTS(s) do { puts(s); fputs(s "\n", report); } while(0)
     size_t changed_regions = 0;
     size_t changed_bytes = 0;
+    for(size_t i = 0; i < kpf_rejected_match_count; ++i)
+    {
+        AUDIT_PRINTF("MATCH_REJECTED_SUMMARY\t%s\t%llu\n",
+                     kpf_rejected_matches[i].name,
+                     (unsigned long long)kpf_rejected_matches[i].rejected);
+    }
     AUDIT_PUTS("KPF_TEST_PATCH_DIFF_BEGIN");
     AUDIT_PUTS("va\tsegment\tsegment_offset\tfile_offset\tspan_bytes\tchanged_bytes\tbefore_hex\tafter_hex");
     for(mach_lc_t *cmd = (mach_lc_t*)(hdr + 1),
@@ -779,8 +810,10 @@ static void __attribute__((noreturn)) process_kernel(int fd)
         exit(-1);
     }
     fprintf(kpf_audit_report,
-            "# KPF matcher callbacks are correlated by candidate VA; DIFF rows are final byte changes and are not attributed to a callback.\n"
-            "# MATCH\tpatch_name\tcandidate_va\tcallback_result\thas_fired\n");
+            "# Accepted callback candidates are listed individually; rejected candidates are counted per patch.\n"
+            "# DIFF rows are final byte changes and are not attributed to a callback.\n"
+            "# MATCH\tpatch_name\tcandidate_va\tcallback_result\thas_fired\n"
+            "# MATCH_REJECTED_SUMMARY\tpatch_name\tcount\n");
     fflush(kpf_audit_report);
 
     module_entry();
