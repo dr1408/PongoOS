@@ -43,6 +43,28 @@
 #include <mach-o/fat.h>
 #include <mach-o/loader.h>
 #include <libkern/OSCacheControl.h>
+
+static FILE *kpf_audit_report;
+
+/* Called by the KPF matcher only in the host test build. This records a
+ * candidate match, not proof that the callback modified bytes at this VA. */
+void kpf_test_record_match(const char *name, uint64_t va,
+                           bool callback_result, bool has_fired)
+{
+    if(!name) name = "<unnamed>";
+    printf("KPF_TEST_MATCH\t%s\t0x%llx\tcallback=%s\tfired=%s\n", name,
+           (unsigned long long)va, callback_result ? "accepted" : "rejected",
+           has_fired ? "yes" : "no");
+    if(kpf_audit_report)
+    {
+        fprintf(kpf_audit_report,
+                "MATCH\t%s\t0x%llx\tcallback=%s\tfired=%s\n", name,
+                (unsigned long long)va,
+                callback_result ? "accepted" : "rejected",
+                has_fired ? "yes" : "no");
+        fflush(kpf_audit_report);
+    }
+}
 #include <TargetConditionals.h>
 #include <paleinfo.h>
 #if TARGET_OS_OSX
@@ -207,6 +229,106 @@ static void dump_patched_kernel(int input_fd, uint32_t fatoff, void *mem,
         exit(-1);
     }
     printf("Dumped patched kernel to %s\n", path);
+}
+
+/* Snapshot and diff every Mach-O segment so callback writes and direct KPF
+ * stores are both visible. The test address is the unslid kernel VA plus the
+ * synthetic fileset slide, while file offsets refer to the input container. */
+static void snapshot_kernel_segments(uint8_t *snapshot, const void *mem,
+                                     uintptr_t lowest, mach_hdr_t *hdr)
+{
+    for(mach_lc_t *cmd = (mach_lc_t*)(hdr + 1),
+                  *end = (mach_lc_t*)((uintptr_t)cmd + hdr->sizeofcmds);
+        cmd < end; cmd = (mach_lc_t*)((uintptr_t)cmd + cmd->cmdsize))
+    {
+        if(cmd->cmd != MACH_SEGMENT) continue;
+        mach_seg_t *seg = (mach_seg_t*)cmd;
+        if(!seg->vmsize) continue;
+        size_t offset = (size_t)(seg->vmaddr - lowest);
+        memcpy(snapshot + offset, (const uint8_t*)mem + offset, seg->vmsize);
+    }
+}
+
+static void report_kernel_patches(const uint8_t *before, const void *mem,
+                                  uintptr_t lowest, uint64_t slide,
+                                  uint32_t fatoff, mach_hdr_t *hdr)
+{
+    FILE *report = kpf_audit_report;
+#define AUDIT_PRINTF(...) do { printf(__VA_ARGS__); fprintf(report, __VA_ARGS__); } while(0)
+#define AUDIT_PUTS(s) do { puts(s); fputs(s "\n", report); } while(0)
+    size_t changed_regions = 0;
+    size_t changed_bytes = 0;
+    AUDIT_PUTS("KPF_TEST_PATCH_DIFF_BEGIN");
+    AUDIT_PUTS("va\tsegment\tsegment_offset\tfile_offset\tspan_bytes\tchanged_bytes\tbefore_hex\tafter_hex");
+    for(mach_lc_t *cmd = (mach_lc_t*)(hdr + 1),
+                  *end = (mach_lc_t*)((uintptr_t)cmd + hdr->sizeofcmds);
+        cmd < end; cmd = (mach_lc_t*)((uintptr_t)cmd + cmd->cmdsize))
+    {
+        if(cmd->cmd != MACH_SEGMENT) continue;
+        mach_seg_t *seg = (mach_seg_t*)cmd;
+        if(!seg->vmsize) continue;
+        size_t segbase = (size_t)(seg->vmaddr - lowest);
+        const uint8_t *old_bytes = before + segbase;
+        const uint8_t *new_bytes = (const uint8_t*)mem + segbase;
+        for(size_t i = 0; i < seg->vmsize;)
+        {
+            if(old_bytes[i] == new_bytes[i])
+            {
+                ++i;
+                continue;
+            }
+            size_t start = i;
+            size_t last_changed = i++;
+            while(i < seg->vmsize)
+            {
+                if(old_bytes[i] != new_bytes[i])
+                {
+                    last_changed = i++;
+                    continue;
+                }
+                size_t gap = 0;
+                while(i + gap < seg->vmsize && gap < 16 &&
+                      old_bytes[i + gap] == new_bytes[i + gap]) ++gap;
+                if(gap == 16 || i + gap == seg->vmsize) break;
+                i += gap;
+            }
+            size_t length = last_changed - start + 1;
+            size_t region_changed = 0;
+            for(size_t j = start; j <= last_changed; ++j)
+                if(old_bytes[j] != new_bytes[j]) ++region_changed;
+            uint64_t fileoff = UINT64_MAX;
+            if(start < seg->filesize && length <= seg->filesize - start)
+                fileoff = (uint64_t)fatoff + seg->fileoff + start;
+            AUDIT_PRINTF("0x%llx\t%.16s\t0x%zx\t",
+                         (unsigned long long)(seg->vmaddr + slide + start),
+                         seg->segname, start);
+            if(fileoff == UINT64_MAX) AUDIT_PRINTF("-\t");
+            else AUDIT_PRINTF("0x%llx\t", (unsigned long long)fileoff);
+            AUDIT_PRINTF("%zu\t%zu\t", length, region_changed);
+            size_t shown = length < 128 ? length : 128;
+            for(size_t j = 0; j < shown; ++j) AUDIT_PRINTF("%02x", old_bytes[start + j]);
+            if(shown != length) AUDIT_PRINTF("...");
+            AUDIT_PRINTF("\t");
+            for(size_t j = 0; j < shown; ++j) AUDIT_PRINTF("%02x", new_bytes[start + j]);
+            if(shown != length) AUDIT_PRINTF("...");
+            AUDIT_PRINTF("\n");
+            ++changed_regions;
+            changed_bytes += region_changed;
+        }
+    }
+    AUDIT_PRINTF("# changed_regions=%zu\tchanged_bytes=%zu\nKPF_TEST_PATCH_DIFF_END\n",
+                 changed_regions, changed_bytes);
+    if(fclose(report) != 0)
+    {
+        fprintf(stderr, "fclose(KPF patch report): %s\n", strerror(errno));
+        exit(-1);
+    }
+    const char *report_path = getenv("KPF_TEST_PATCH_REPORT");
+    if(!report_path || !report_path[0]) report_path = "kpf-patch-report.tsv";
+    printf("Wrote KPF patch report to %s\n", report_path);
+    kpf_audit_report = NULL;
+#undef AUDIT_PRINTF
+#undef AUDIT_PUTS
 }
 
 #define NUM_JIT 1
@@ -639,6 +761,28 @@ static void __attribute__((noreturn)) process_kernel(int fd)
     printf("Kernel at 0x%llx, entry at 0x%llx", (uint64_t)mem, (uint64_t)gEntryPoint);
     palera1n_flags = palerain_option_rootful;
 
+    uint8_t *patch_snapshot = malloc(mlen);
+    if(!patch_snapshot)
+    {
+        fprintf(stderr, "malloc(KPF patch snapshot): %s\n", strerror(errno));
+        exit(-1);
+    }
+    memset(patch_snapshot, 0, mlen);
+    snapshot_kernel_segments(patch_snapshot, mem, lowest, hdr);
+
+    const char *report_path = getenv("KPF_TEST_PATCH_REPORT");
+    if(!report_path || !report_path[0]) report_path = "kpf-patch-report.tsv";
+    kpf_audit_report = fopen(report_path, "w");
+    if(!kpf_audit_report)
+    {
+        fprintf(stderr, "fopen(%s): %s\n", report_path, strerror(errno));
+        exit(-1);
+    }
+    fprintf(kpf_audit_report,
+            "# KPF matcher callbacks are correlated by candidate VA; DIFF rows are final byte changes and are not attributed to a callback.\n"
+            "# MATCH\tpatch_name\tcandidate_va\tcallback_result\thas_fired\n");
+    fflush(kpf_audit_report);
+
     module_entry();
     const char *overlay_path = getenv("KPF_TEST_OVERLAY");
     if(overlay_path && overlay_path[0] != '\0')
@@ -646,6 +790,10 @@ static void __attribute__((noreturn)) process_kernel(int fd)
         load_overlay_for_test(overlay_path);
     }
     preboot_hook();
+
+    report_kernel_patches(patch_snapshot, mem, lowest, test_slide,
+                          fatoff, hdr);
+    free(patch_snapshot);
 
     const char *dump_path = getenv("KPF_TEST_DUMP");
     if(dump_path && dump_path[0] != '\0')

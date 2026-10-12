@@ -896,9 +896,15 @@ void xnu_pf_maskmatch_match(struct xnu_pf_maskmatch* patch, uint8_t access_type,
     }
     if (val) {
         jit_set_exec(0);
-        if (patch->patch.pf_callback((struct xnu_pf_patch *)patch, cacheable_stream)) {
+        bool accepted = patch->patch.pf_callback((struct xnu_pf_patch *)patch, cacheable_stream);
+        if (accepted) {
             patch->patch.has_fired = true;
         }
+#ifdef KPF_TEST
+        extern void kpf_test_record_match(const char*, uint64_t, bool, bool);
+        kpf_test_record_match(patch->patch.name, xnu_ptr_to_va(cacheable_stream),
+                              accepted, patch->patch.has_fired);
+#endif
         jit_set_exec(1);
     }
 }
@@ -926,9 +932,15 @@ void xnu_pf_ptr_to_data_match(struct xnu_pf_ptr_to_datamatch* patch, uint8_t acc
     if (pointer >= patch->range->va && pointer < (patch->range->va + patch->range->size)) {
         if (memcmp(patch->data, (void*)(pointer - patch->range->va + patch->range->cacheable_base), patch->datasz) == 0) {
             jit_set_exec(0);
-            if (patch->patch.pf_callback((struct xnu_pf_patch *)patch, cacheable_stream)) {
+            bool accepted = patch->patch.pf_callback((struct xnu_pf_patch *)patch, cacheable_stream);
+            if (accepted) {
                 patch->patch.has_fired = true;
             }
+#ifdef KPF_TEST
+            extern void kpf_test_record_match(const char*, uint64_t, bool, bool);
+            kpf_test_record_match(patch->patch.name, xnu_ptr_to_va(cacheable_stream),
+                                  accepted, patch->patch.has_fired);
+#endif
             jit_set_exec(1);
         }
     }
@@ -952,7 +964,6 @@ xnu_pf_patch_t* xnu_pf_maskmatch(xnu_pf_patchset_t* patchset, char * name, uint6
     mm->patch.pf_emit = (void*)xnu_pf_maskmatch_emit;
     mm->patch.pf_match = (void*)xnu_pf_maskmatch_match;
     mm->patch.is_required = required;
-    mm->patch.name = "ptr_to_data";
     mm->patch.name = name;
     mm->pair_count = entryc;
 
@@ -981,6 +992,7 @@ xnu_pf_patch_t* xnu_pf_ptr_to_data(xnu_pf_patchset_t* patchset, uint64_t slide, 
     mm->patch.pf_emit = (void*)xnu_pf_ptr_to_data_emit;
     mm->patch.pf_match = (void*)xnu_pf_ptr_to_data_match;
     mm->patch.is_required = required;
+    mm->patch.name = "ptr_to_data";
     extern uint32_t pf_jit_ptr_comparison_start, pf_jit_ptr_comparison_next;
     mm->patch.pfjit_max_emit_size = (&pf_jit_ptr_comparison_next - &pf_jit_ptr_comparison_start) * 4 + 16 * 4 + 32;
 
