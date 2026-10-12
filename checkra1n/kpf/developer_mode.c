@@ -36,6 +36,16 @@
 
 static bool need_developer_mode_patch = false;
 
+static bool kpf_developer_mode_force_gate_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    // XR 18.7.10 otherwise enters the ACM query and can validate PID 1 while
+    // developer mode is still off. Take AMFI's native force-enable path first.
+    opcode_stream[3] = 0x14000006; // b +0x18
+
+    puts("KPF: Found developer mode pre-ACM force gate (XR 18.7.10)");
+    return true;
+}
+
 static bool kpf_developer_mode_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
 {
     static uint32_t *enable_developer_mode  = NULL,
@@ -122,6 +132,32 @@ static void kpf_developer_mode_patch(xnu_pf_patchset_t *amfi_text_exec_patchset)
         0xfc000000,
     };
     xnu_pf_maskmatch(amfi_text_exec_patchset, "developer_mode", matches, masks, sizeof(matches)/sizeof(uint64_t), true, (void*)kpf_developer_mode_callback);
+
+    if(gKernelVersion.darwinMajor == 24 && xnu_platform() == PLATFORM_IOS)
+    {
+        // iPhone XR 18.7.10 AMFI initialization:
+        //   adrp/add x9, flag; ldrb w9, [x9, #7]
+        //   tbz w9, #0, force_enable; cbz w8, query_acm
+        uint64_t force_gate_matches[] =
+        {
+            0x90000009,
+            0x91000129,
+            0x39401d29,
+            0x360000c9,
+            0x34000148,
+        };
+        uint64_t force_gate_masks[] =
+        {
+            0x9f00001f,
+            0xffc003ff,
+            0xffffffff,
+            0xffffffff,
+            0xffffffff,
+        };
+        xnu_pf_maskmatch(amfi_text_exec_patchset, "developer_mode_pre_acm_force_gate_xr_18710",
+            force_gate_matches, force_gate_masks, sizeof(force_gate_matches)/sizeof(uint64_t), true,
+            (void*)kpf_developer_mode_force_gate_callback);
+    }
 }
 
 static void kpf_developer_mode_init(struct mach_header_64 *hdr, xnu_pf_range_t *cstring)
