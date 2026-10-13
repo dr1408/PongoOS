@@ -27,6 +27,45 @@
 #include <xnu/xnu.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
+
+static const char *kpf_adrp_add_string(uint32_t *opcode_stream)
+{
+    return (const char *)(((uint64_t)opcode_stream & ~0xfffULL) +
+        adrp_off(opcode_stream[0]) + ((opcode_stream[1] >> 10) & 0xfff));
+}
+
+static bool kpf_usb_restore_mode_xr_18710_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    // AppleUSBHost/IOAccessoryManager asks whether this is a restore/ramdisk
+    // boot by parsing both "rd" and "rootdev" into the same 32-byte buffer.
+    // Pongo renames rootdev to spartan, so the native predicate incorrectly
+    // returns false and IOAccessoryTRM publishes
+    // SupervisedTransportsRestricted=true.  Match both parse sites and their
+    // shared helper before forcing only this predicate to return true.
+    if(strcmp(kpf_adrp_add_string(opcode_stream), "rd") != 0 ||
+       strcmp(kpf_adrp_add_string(opcode_stream + 7), "rootdev") != 0 ||
+       opcode_stream[9] != 0x910003e1 || // mov x1, sp
+       opcode_stream[10] != 0x52800402 || // mov w2, #0x20
+       (opcode_stream[11] & 0xfc000000) != 0x94000000 ||
+       follow_call(opcode_stream + 4) != follow_call(opcode_stream + 11))
+    {
+        return false;
+    }
+
+    uint32_t *predicate = opcode_stream - 11;
+    if(predicate[0] != 0xd503237f || // pacibsp
+       predicate[1] != 0xd10143ff)   // sub sp, sp, #0x50
+    {
+        return false;
+    }
+
+    predicate[0] = 0xd2800020; // mov x0, #1
+    predicate[1] = 0xd65f03c0; // ret
+
+    puts("KPF: Found USB restore-mode predicate (XR 18.7.10)");
+    return true;
+}
 
 static bool kpf_sep_panic_check_xr_18710_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
 {
@@ -86,11 +125,44 @@ static void kpf_sep_patches(xnu_pf_patchset_t *sep_text_exec_patchset)
         (void *)kpf_sep_panic_check_xr_18710_callback);
 }
 
+static void kpf_usb_restore_mode_patches(xnu_pf_patchset_t *accessory_text_exec_patchset)
+{
+    if(gKernelVersion.darwinMajor != 24 || xnu_platform() != PLATFORM_IOS)
+    {
+        return;
+    }
+
+    // First boot-argument parse in the restore-mode predicate:
+    //   adrp/add x0, "rd"; mov x1, sp; mov w2, #0x20; bl parse_boot_arg
+    // The callback validates the nearby "rootdev" parse, common call target,
+    // and exact function prologue before writing anything.
+    uint64_t matches[] =
+    {
+        0x90000000,
+        0x91000000,
+        0x910003e1,
+        0x52800402,
+        0x94000000,
+    };
+    uint64_t masks[] =
+    {
+        0x9f00001f,
+        0xffc003ff,
+        0xffffffff,
+        0xffffffff,
+        0xfc000000,
+    };
+    xnu_pf_maskmatch(accessory_text_exec_patchset, "usb_restore_mode_xr_18710",
+        matches, masks, sizeof(matches) / sizeof(uint64_t), true,
+        (void *)kpf_usb_restore_mode_xr_18710_callback);
+}
+
 kpf_component_t kpf_sep =
 {
     .patches =
     {
         { "com.apple.driver.AppleSEPManager", "__TEXT_EXEC", "__text", XNU_PF_ACCESS_32BIT, kpf_sep_patches },
+        { "com.apple.iokit.IOAccessoryManager", "__TEXT_EXEC", "__text", XNU_PF_ACCESS_32BIT, kpf_usb_restore_mode_patches },
         {},
     },
 };
