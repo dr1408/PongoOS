@@ -2433,6 +2433,7 @@ static void kpf_cmd(void)
         &kpf_shellcode,
         &kpf_overlay,
         &kpf_ramdisk,
+        &kpf_sep,
         &kpf_spawn_validate_persona,
         &kpf_trustcache,
         &kpf_vfs,
