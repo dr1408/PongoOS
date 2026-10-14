@@ -157,6 +157,9 @@ static void kpf_ramdisk_bootprep(struct mach_header_64 *hdr)
 
 #if !defined(KPF_TEST)
     char BSDName[16];
+    // paleinfo.rootdev is needed even when root-matching remains unchanged.
+    // In that case fakedyld still waits for this device's system volume.
+    snprintf(BSDName, sizeof(BSDName), "%s1", disk_prefix());
     /* have SSV and rootful */
     if ((palera1n_flags & (palerain_option_rootful | palerain_option_ssv)) == (palerain_option_rootful | palerain_option_ssv)) {
         dt_node_t* chosen = dt_find(gDeviceTree, "chosen");
@@ -168,9 +171,6 @@ static void kpf_ramdisk_bootprep(struct mach_header_64 *hdr)
         size_t root_matching_len = 0;
         char* root_matching = dt_prop(chosen, "root-matching", &root_matching_len);
         if (!root_matching) panic("invalid devicetree: no prop!");
-
-        // this is required for root-on-md0
-        snprintf(BSDName, 16, "%s%" PRIu32, disk_prefix() , 1);
 
         /* Don't root from fakefs during fakefs setup or force revert */
         if ((palera1n_flags & (palerain_option_setup_rootful | palerain_option_force_revert)) == 0) {
@@ -190,7 +190,7 @@ static void kpf_ramdisk_bootprep(struct mach_header_64 *hdr)
         printf("KPF: root BSD Name: %s\n", BSDName);
         printf("KPF: root_matching (raw): %s\n", root_matching);
     } else {
-        printf("KPF: root BSD Name unchanged\n");
+        printf("KPF: root BSD Name unchanged (paleinfo rootdev: %s)\n", BSDName);
     }
 
     if(ramdisk_size)

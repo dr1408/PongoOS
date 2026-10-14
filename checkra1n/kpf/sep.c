@@ -79,6 +79,17 @@ static bool kpf_sep_panic_check_xr_18710_callback(struct xnu_pf_patch *patch, ui
     return true;
 }
 
+static bool kpf_sep_boot_timeout_xr_18710_callback(struct xnu_pf_patch *patch, uint32_t *opcode_stream)
+{
+    // Distinct from AppleSEPManager::_didTimeout: this callback reports the
+    // fatal boot stage when SEP never reaches the OS-active state.
+    opcode_stream[0] = 0xd2800000; // mov x0, #0
+    opcode_stream[1] = 0xd65f03c0; // ret
+
+    puts("KPF: Found SEP boot timeout (XR 18.7.10)");
+    return true;
+}
+
 static void kpf_sep_patches(xnu_pf_patchset_t *sep_text_exec_patchset)
 {
     if(gKernelVersion.darwinMajor != 24 || xnu_platform() != PLATFORM_IOS)
@@ -123,6 +134,39 @@ static void kpf_sep_patches(xnu_pf_patchset_t *sep_text_exec_patchset)
     xnu_pf_maskmatch(sep_text_exec_patchset, "sep_panic_check_xr_18710",
         matches, masks, sizeof(matches) / sizeof(uint64_t), true,
         (void *)kpf_sep_panic_check_xr_18710_callback);
+
+    // XR 18.7.10 AppleSEPManager boot-timeout callback (0xfffffff00928f4e8):
+    //   pacibsp; sub sp, sp, #0x20; stp x29, x30, [sp, #0x10]
+    //   add x29, sp, #0x10; ldr w8, [x0, #0xdc]; cmp w8, #7
+    //   b.eq return; add x1, x0, #0xdc; sub w9, w8, #5
+    uint64_t boot_timeout_matches[] =
+    {
+        0xd503237f,
+        0xd10083ff,
+        0xa9017bfd,
+        0x910043fd,
+        0xb940dc08,
+        0x71001d1f,
+        0x54000000,
+        0x91037001,
+        0x51001509,
+    };
+    uint64_t boot_timeout_masks[] =
+    {
+        0xffffffff,
+        0xffffffff,
+        0xffffffff,
+        0xffffffff,
+        0xffffffff,
+        0xffffffff,
+        0xff00001f,
+        0xffffffff,
+        0xffffffff,
+    };
+    xnu_pf_maskmatch(sep_text_exec_patchset, "sep_boot_timeout_xr_18710",
+        boot_timeout_matches, boot_timeout_masks,
+        sizeof(boot_timeout_matches) / sizeof(uint64_t), true,
+        (void *)kpf_sep_boot_timeout_xr_18710_callback);
 }
 
 static void kpf_usb_restore_mode_patches(xnu_pf_patchset_t *accessory_text_exec_patchset)
