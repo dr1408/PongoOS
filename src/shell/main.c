@@ -26,6 +26,7 @@
  */
 #include <pongo.h>
 #include <lzma/lzmadec.h>
+#include "../drivers/dt/dt_write.h"
 
 extern volatile char gBootFlag;
 
@@ -301,6 +302,10 @@ void shell_main(void) {
     command_register("spawn", "starts a usermode process", spawn_cmd);
     command_register("paging", "tests paging", paging_cmd);
     command_register("recursion", "tests stack guards", recursion_cmd);
+    command_register("dtread", "reads a DeviceTree property", dt_read_cmd);
+    command_register("dtwrite", "writes an existing DeviceTree property (hex bytes)", dt_write_cmd);
+    command_register("dtrename", "renames an existing DeviceTree property", dt_rename_cmd);
+    command_register("dtadd", "adds a DeviceTree property (optional hex bytes)", dt_add_cmd);
     usbloader_init();
 
     /*
